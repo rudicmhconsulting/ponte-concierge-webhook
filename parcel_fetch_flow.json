@@ -1,0 +1,93 @@
+{
+  "version": "3.0",
+  "screens": [
+    {
+      "id": "PARCEL_DETAILS",
+      "title": "Fetch My Parcel",
+      "terminal": false,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextBody",
+            "text": "Please provide your apartment details so our runner can bring your parcel up."
+          },
+          {
+            "type": "TextInput",
+            "name": "unit_number",
+            "label": "Apartment / Unit Number",
+            "required": true,
+            "input-type": "text"
+          },
+          {
+            "type": "Dropdown",
+            "name": "courier_name",
+            "label": "Courier Service",
+            "required": true,
+            "options": [
+              { "id": "takealot", "title": "Takealot" },
+              { "id": "shein", "title": "Shein / Temu" },
+              { "id": "dhl_aramex", "title": "DHL / Aramex / Courier Guy" },
+              { "id": "other", "title": "Other / Unknown" }
+            ]
+          },
+          {
+            "type": "TextInput",
+            "name": "special_instructions",
+            "label": "Delivery Notes / Instructions (Optional)",
+            "required": false,
+            "input-type": "text"
+          },
+          {
+            "type": "Footer",
+            "label": "Request Runner",
+            "on-click-action": {
+              "name": "navigate",
+              "next": {
+                "type": "screen",
+                "name": "CONFIRMATION"
+              },
+              "payload": {
+                "unit_number": "${form.unit_number}",
+                "courier_name": "${form.courier_name}",
+                "special_instructions": "${form.special_instructions}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "CONFIRMATION",
+      "title": "Request Submitted",
+      "terminal": true,
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Runner Dispatched!"
+          },
+          {
+            "type": "TextBody",
+            "text": "Your request has been logged with the Ponte Concierge desk. A runner is retrieving your package now."
+          },
+          {
+            "type": "Footer",
+            "label": "Done",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "status": "DISPATCHED",
+                "unit_number": "${data.unit_number}",
+                "courier_name": "${data.courier_name}",
+                "special_instructions": "${data.special_instructions}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
