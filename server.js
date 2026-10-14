@@ -6,7 +6,7 @@ const axios = require('axios');
 const app = express();
 app.use(bodyParser.json());
 
-// Environment variables
+// Environment variables & network binding
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ponte_concierge_secure_token';
@@ -125,7 +125,6 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
 }
 
 // Start Server
-const HOST = '0.0.0.0';
 app.listen(PORT, HOST, () => {
   console.log(`Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
 });
