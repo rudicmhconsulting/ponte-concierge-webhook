@@ -1,0 +1,102 @@
+{
+  "version": "3.0",
+  "screens": [
+    {
+      "id": "VISITOR_INFO",
+      "title": "Issue Visitor Pass",
+      "terminal": false,
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextBody",
+            "text": "Pre-clear your guest or service provider for seamless access at the entry gate."
+          },
+          {
+            "type": "TextInput",
+            "name": "visitor_name",
+            "label": "Full Name of Visitor",
+            "required": true,
+            "input-type": "text"
+          },
+          {
+            "type": "TextInput",
+            "name": "visitor_mobile",
+            "label": "Visitor Mobile Number (Optional)",
+            "required": false,
+            "input-type": "phone"
+          },
+          {
+            "type": "Dropdown",
+            "name": "entry_type",
+            "label": "Access Type",
+            "required": true,
+            "options": [
+              { "id": "pedestrian", "title": "Pedestrian / Walk-in" },
+              { "id": "vehicle", "title": "Vehicle Entry" },
+              { "id": "uber_bolt", "title": "E-Hailing (Uber / Bolt)" },
+              { "id": "contractor", "title": "Contractor / Service Delivery" }
+            ]
+          },
+          {
+            "type": "TextInput",
+            "name": "vehicle_reg",
+            "label": "Vehicle License Plate (If applicable)",
+            "required": false,
+            "input-type": "text"
+          },
+          {
+            "type": "Footer",
+            "label": "Generate Gate Pass",
+            "on-click-action": {
+              "name": "navigate",
+              "next": {
+                "type": "screen",
+                "name": "PASS_GENERATED"
+              },
+              "payload": {
+                "visitor_name": "${form.visitor_name}",
+                "visitor_mobile": "${form.visitor_mobile}",
+                "entry_type": "${form.entry_type}",
+                "vehicle_reg": "${form.vehicle_reg}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "PASS_GENERATED",
+      "title": "Pass Ready",
+      "terminal": true,
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Single-Use QR Pass Issued!"
+          },
+          {
+            "type": "TextBody",
+            "text": "Your visitor pass request is active. Security will scan the generated QR code upon arrival."
+          },
+          {
+            "type": "Footer",
+            "label": "Complete Request",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "status": "APPROVED",
+                "visitor_name": "${data.visitor_name}",
+                "visitor_mobile": "${data.visitor_mobile}",
+                "entry_type": "${data.entry_type}",
+                "vehicle_reg": "${data.vehicle_reg}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
