@@ -62,11 +62,35 @@ app.post('/webhook', async (req, res) => {
             // Example automated auto-reply for testing
             await sendWhatsAppMessage(senderPhone, `Ponte Concierge received: "${messageBody}". We are setting up your request!`);
 
+// Replace the interactive section inside your POST /webhook block in server.js with this:
+
           } else if (message.type === 'interactive') {
-            // Handles button clicks or Flows submission responses
             const interactiveType = message.interactive.type;
             console.log(`Interactive Type: ${interactiveType}`);
 
+            if (interactiveType === 'nfm_reply') {
+              // Parse the JSON payload returned from the WhatsApp Flow submission
+              const responseJson = JSON.parse(message.interactive.nfm_reply.response_json);
+              console.log('Flow Response Payload:', responseJson);
+
+              // Route based on which flow form was submitted
+              if (responseJson.unit_number) {
+                // This is a Parcel Fetch Request
+                console.log(`📦 Parcel Request - Unit: ${responseJson.unit_number}, Courier: ${responseJson.courier_name}`);
+                await sendWhatsAppMessage(
+                  senderPhone, 
+                  `📦 Runner requested for Unit ${responseJson.unit_number} (${responseJson.courier_name}). Our team is on it!`
+                );
+              } else if (responseJson.visitor_name) {
+                // This is a Visitor Pass Request
+                console.log(`🎫 Visitor Pass - Name: ${responseJson.visitor_name}, Type: ${responseJson.entry_type}`);
+                await sendWhatsAppMessage(
+                  senderPhone, 
+                  `🎫 Gate pass generated for ${responseJson.visitor_name}. Security has been notified for your ${responseJson.entry_type} entry.`
+                );
+              }
+            }
+          }
             if (interactiveType === 'nfm_reply') {
               // This is the payload returned when a resident completes a WhatsApp Flow (e.g., parcel fetch or visitor pass)
               const responseJson = JSON.parse(message.interactive.nfm_reply.response_json);
