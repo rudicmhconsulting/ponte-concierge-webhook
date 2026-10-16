@@ -97,7 +97,10 @@ res.sendStatus(200);
     return res.sendStatus(404);
   }
 });
-
+// Health check route to clear "Cannot GET /"
+app.get('/', (req, res) => {
+  return res.status(200).send('Ponte Concierge Webhook Service is Active 🚀');
+});
 // ==========================================
 // 3. HELPER: SEND WHATSAPP MESSAGE
 // ==========================================
