@@ -92,9 +92,9 @@ res.sendStatus(200);
         }
       }
     }
-    res.status(200).send('EVENT_RECEIVED');
+    return res.status(200).send('EVENT_RECEIVED');
   } else {
-    res.sendStatus(404);
+    return res.sendStatus(404);
   }
 });
 
