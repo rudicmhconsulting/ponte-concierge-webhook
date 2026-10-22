@@ -51,14 +51,34 @@ res.sendStatus(200);
           
           console.log(`Received message from ${senderPhone} (ID: ${messageId})`);
 
-          // Direct Text Messages
-          if (message.type === 'text') {
-            const messageBody = message.text.body;
-            console.log(`Text Content: "${messageBody}"`);
-            await sendWhatsAppMessage(
+         // Direct Text Messages
+        if (message.type === 'text') {
+          const messageBody = message.body.text.body.toLowerCase().trim();
+          console.log(`Text Content: "${messageBody}"`);
+          
+          if (messageBody.includes('parcel') || messageBody.includes('fetch')) {
+            await sendWhatsAppFlow(
               senderPhone, 
-              `Ponte Concierge received: "${messageBody}". Please use our menu options to request a parcel fetch or issue a visitor pass!`
+              "2210586496532912", // Your Package Collect / Parcel Fetch Flow ID
+              "PARCEL_DETAILS", 
+              "Fetch Parcel", 
+              "Tap below to request a parcel runner."
             );
+          } else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
+            await sendWhatsAppFlow(
+              senderPhone, 
+              "259347371166581", // Your Visitor Pass Flow ID
+              "VISITOR_INFO", 
+              "Issue Pass", 
+              "Tap below to pre-clear a visitor."
+            );
+          } else {
+            await sendWhatsAppMessage(
+              senderPhone,
+              `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
+            );
+          }
+        }
 
           // Interactive Flow Responses
           } else if (message.type === 'interactive') {
