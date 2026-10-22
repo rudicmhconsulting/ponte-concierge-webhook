@@ -17,22 +17,22 @@ app.get('/webhook', (req, res) => {
   if (mode && token) {
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
       console.log('WEBHOOK_VERIFIED');
-      res.status(200).send(challenge);
+      return res.status(200).send(challenge);
     } else {
-      res.sendStatus(403);
+      return res.sendStatus(403);
     }
   } else {
-    res.sendStatus(403);
+    return res.sendStatus(403);
   }
 });
 
 // 2. EVENT LISTENER & ROUTER (POST /webhook)
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
+  return; // Terminate immediately to prevent header conflicts
 
   try {
     const body = req.body;
-
     if (body.object === 'whatsapp_business_account') {
       for (const entry of body.entry) {
         for (const change of entry.changes) {
@@ -48,19 +48,17 @@ app.post('/webhook', async (req, res) => {
               console.log(`💬 Text Content: "${messageBody}"`);
 
               if (messageBody.includes('parcel') || messageBody.includes('fetch') || messageBody.includes('collect')) {
-                console.log('📦 Triggering Package Collect Flow...');
                 await sendWhatsAppFlow(
                   senderPhone, 
-                  "2210586496532912", // Package Collect Flow ID
+                  "2210586496532912", 
                   "PARCEL_DETAILS", 
                   "Fetch Parcel", 
                   "Tap below to request a parcel runner."
                 );
               } else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
-                console.log('🎫 Triggering Visitor Pass Flow...');
                 await sendWhatsAppFlow(
                   senderPhone, 
-                  "2593473711166581", // Visitor Pass Flow ID
+                  "2593473711166581", 
                   "VISITOR_INFO", 
                   "Issue Pass", 
                   "Tap below to pre-clear a visitor."
@@ -70,29 +68,6 @@ app.post('/webhook', async (req, res) => {
                   senderPhone,
                   `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
                 );
-              }
-            }
-
-            // Interactive Flow Responses (Form Submissions)
-            else if (message.type === 'interactive') {
-              const interactiveType = message.interactive.type;
-
-              if (interactiveType === 'nfm_reply') {
-                const responseJson = JSON.parse(message.interactive.nfm_reply.response_json);
-
-                if (responseJson.unit_number) {
-                  console.log(`✅ Parcel Request Logged - Unit: ${responseJson.unit_number}`);
-                  await sendWhatsAppMessage(
-                    senderPhone,
-                    `Success! Runner dispatched to unit ${responseJson.unit_number} for ${responseJson.courier_name}.`
-                  );
-                } else if (responseJson.visitor_name) {
-                  console.log(`✅ Visitor Pass Logged - Name: ${responseJson.visitor_name}`);
-                  await sendWhatsAppMessage(
-                    senderPhone,
-                    `Gate pass generated for ${responseJson.visitor_name}. Security notified.`
-                  );
-                }
               }
             }
           }
@@ -125,7 +100,6 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
         text: { body: messageText },
       }),
     });
-    console.log(`📤 Text reply sent successfully to ${recipientPhone}`);
   } catch (error) {
     console.error('❌ Error sending WhatsApp message:', error.message);
   }
@@ -166,9 +140,7 @@ async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bod
       body: JSON.stringify(payload)
     });
 
-    const data = await response.json();
-    console.log(`📤 Flow message sent successfully to ${recipientPhone}`);
-    return data;
+    return await response.json();
   } catch (error) {
     console.error('❌ Error sending WhatsApp Flow:', error.message);
   }
