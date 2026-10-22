@@ -185,6 +185,17 @@ async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bod
 
   return await response.json();
 }
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  return await response.json();
+}
 // Start Server
 app.listen(PORT, HOST, () => {
   console.log(`Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
