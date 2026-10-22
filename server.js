@@ -29,80 +29,89 @@ app.get('/webhook', (req, res) => {
 
 // 2. EVENT LISTENER & ROUTER (POST /webhook)
 app.post('/webhook', async (req, res) => {
-  const body = req.body;
+  // ALWAYS respond with 200 OK immediately to satisfy Meta
   res.sendStatus(200);
 
-  if (body.object === 'whatsapp_business_account') {
-    for (const entry of body.entry) {
-      for (const change of entry.changes) {
-        const value = change.value;
+  try {
+    const body = req.body;
+    console.log('📥 Incoming Webhook Payload:', JSON.stringify(body, null, 2));
 
-        if (value && value.messages && value.messages.length > 0) {
-          const message = value.messages[0];
-          const senderPhone = message.from;
-          const messageId = message.id;
+    if (body.object === 'whatsapp_business_account') {
+      for (const entry of body.entry) {
+        for (const change of entry.changes) {
+          const value = change.value;
 
-          console.log(`Received message from ${senderPhone} (ID: ${messageId})`);
+          if (value && value.messages && value.messages.length > 0) {
+            const message = value.messages[0];
+            const senderPhone = message.from;
 
-          // Direct Text Messages
-          if (message.type === 'text') {
-            const messageBody = message.text.body.toLowerCase().trim();
-            console.log(`Text Content: "${messageBody}"`);
+            console.log(`📩 Received message type [${message.type}] from ${senderPhone}`);
 
-            if (messageBody.includes('parcel') || messageBody.includes('fetch') || messageBody.includes('collect')) {
-              await sendWhatsAppFlow(
-                senderPhone, 
-                "2210586496532912", // Package Collect Flow ID
-                "PARCEL_DETAILS", 
-                "Fetch Parcel", 
-                "Tap below to request a parcel runner."
-              );
-            } else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
-              await sendWhatsAppFlow(
-                senderPhone, 
-                "2593473711166581", // Visitor Pass Flow ID
-                "VISITOR_INFO", 
-                "Issue Pass", 
-                "Tap below to pre-clear a visitor."
-              );
-            } else {
-              await sendWhatsAppMessage(
-                senderPhone,
-                `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
-              );
+            // Direct Text Messages
+            if (message.type === 'text') {
+              const messageBody = message.text.body.toLowerCase().trim();
+              console.log(`💬 Text Content: "${messageBody}"`);
+
+              if (messageBody.includes('parcel') || messageBody.includes('fetch') || messageBody.includes('collect')) {
+                console.log('📦 Triggering Package Collect Flow...');
+                await sendWhatsAppFlow(
+                  senderPhone, 
+                  "2210586496532912", // Package Collect Flow ID
+                  "PARCEL_DETAILS", 
+                  "Fetch Parcel", 
+                  "Tap below to request a parcel runner."
+                );
+              } else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
+                console.log('🎫 Triggering Visitor Pass Flow...');
+                await sendWhatsAppFlow(
+                  senderPhone, 
+                  "2593473711166581", // Visitor Pass Flow ID
+                  "VISITOR_INFO", 
+                  "Issue Pass", 
+                  "Tap below to pre-clear a visitor."
+                );
+              } else {
+                console.log('ℹ️ Sending fallback help text.');
+                await sendWhatsAppMessage(
+                  senderPhone,
+                  `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
+                );
+              }
             }
-          }
 
-          // Interactive Flow Responses
-          else if (message.type === 'interactive') {
-            const interactiveType = message.interactive.type;
-            console.log(`Interactive Type: ${interactiveType}`);
+            // Interactive Flow Responses (Form Submissions)
+            else if (message.type === 'interactive') {
+              const interactiveType = message.interactive.type;
+              console.log(`🔀 Interactive Type: ${interactiveType}`);
 
-            if (interactiveType === 'nfm_reply') {
-              const responseJson = JSON.parse(message.interactive.nfm_reply.response_json);
-              console.log('Flow Response Payload:', responseJson);
+              if (interactiveType === 'nfm_reply') {
+                const responseJson = JSON.parse(message.interactive.nfm_reply.response_json);
+                console.log('📋 Flow Response Payload:', responseJson);
 
-              // Package Collect / Parcel Fetch Flow Submission
-              if (responseJson.unit_number) {
-                console.log(`📦 Parcel Request - Unit: ${responseJson.unit_number}, Courier: ${responseJson.courier_name}`);
-                await sendWhatsAppMessage(
-                  senderPhone,
-                  `Success! Runner dispatched to unit ${responseJson.unit_number} for ${responseJson.courier_name}.`
-                );
-              } 
-              // Visitor Pass Flow Submission
-              else if (responseJson.visitor_name) {
-                console.log(`🎫 Visitor Pass - Name: ${responseJson.visitor_name}, Type: ${responseJson.entry_type}`);
-                await sendWhatsAppMessage(
-                  senderPhone,
-                  `Gate pass generated for ${responseJson.visitor_name} (${responseJson.entry_type}). Security notified.`
-                );
+                // Package Collect / Parcel Fetch Flow Submission
+                if (responseJson.unit_number) {
+                  console.log(`✅ Parcel Request Logged - Unit: ${responseJson.unit_number}, Courier: ${responseJson.courier_name}`);
+                  await sendWhatsAppMessage(
+                    senderPhone,
+                    `Success! Runner dispatched to unit ${responseJson.unit_number} for ${responseJson.courier_name}.`
+                  );
+                } 
+                // Visitor Pass Flow Submission
+                else if (responseJson.visitor_name) {
+                  console.log(`✅ Visitor Pass Logged - Name: ${responseJson.visitor_name}, Type: ${responseJson.entry_type}`);
+                  await sendWhatsAppMessage(
+                    senderPhone,
+                    `Gate pass generated for ${responseJson.visitor_name} (${responseJson.entry_type}). Security notified.`
+                  );
+                }
               }
             }
           }
         }
       }
     }
+  } catch (err) {
+    console.error('❌ Error processing webhook:', err);
   }
 });
 
@@ -111,7 +120,7 @@ app.get('/', (req, res) => {
   return res.status(200).send('Ponte Concierge Webhook Service is Active 🚀');
 });
 
-// 3. HELPER: SEND WHATSAPP MESSAGE
+// 3. HELPER: SEND TEXT MESSAGE
 async function sendWhatsAppMessage(recipientPhone, messageText) {
   try {
     await axios.post(
@@ -124,58 +133,61 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          Authorization: `Bearer ${process.env.PHONE_NUMBER_TOKEN || process.env.WHATSAPP_TOKEN}`,
           'Content-Type': 'application/json',
         },
       }
     );
-    console.log(`Reply sent successfully to ${recipientPhone}`);
+    console.log(`📤 Text reply sent successfully to ${recipientPhone}`);
   } catch (error) {
-    console.error('Error sending WhatsApp message:', error.response?.data || error.message);
+    console.error('❌ Error sending WhatsApp message:', error.response?.data || error.message);
   }
 }
 
 // 4. HELPER: SEND WHATSAPP FLOW
 async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bodyText) {
-  const token = process.env.WHATSAPP_TOKEN;
-  const phoneId = process.env.PHONE_NUMBER_ID;
+  try {
+    const token = process.env.WHATSAPP_TOKEN;
+    const phoneId = process.env.PHONE_NUMBER_ID;
 
-  const url = `https://graph.facebook.com/v18.0/${phoneId}/messages`;
-  const payload = {
-    messaging_product: "whatsapp",
-    to: recipientPhone,
-    type: "interactive",
-    interactive: {
-      type: "flow",
+    const url = `https://graph.facebook.com/v18.0/${phoneId}/messages`;
+    const payload = {
+      messaging_product: "whatsapp",
+      to: recipientPhone,
+      type: "interactive",
+      interactive: {
+        type: "flow",
       body: { text: bodyText },
-      action: {
-        name: "flow",
-        parameters: {
-          flow_message_version: "3",
-          flow_id: flowId,
-          flow_cta: ctaText,
-          flow_action: "navigate",
-          flow_action_payload: {
-            screen: screenName
+        action: {
+          name: "flow",
+          parameters: {
+            flow_message_version: "3",
+            flow_id: flowId,
+            flow_cta: ctaText,
+            flow_action: "navigate",
+            flow_action_payload: {
+              screen: screenName
+            }
           }
         }
       }
-    }
-  };
+    };
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": "Bearer " + token,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
+    const response = await axios.post(url, payload, {
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
 
-  return await response.json();
+    console.log(`📤 Flow message sent successfully to ${recipientPhone}`);
+    return response.data;
+  } catch (error) {
+    console.error('❌ Error sending WhatsApp Flow:', error.response?.data || error.message);
+  }
 }
 
 // Start Server
 app.listen(PORT, HOST, () => {
-  console.log(`Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
+  console.log(`🚀 Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
 });
