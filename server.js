@@ -1,4 +1,3 @@
-require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -6,16 +5,11 @@ const axios = require('axios');
 const app = express();
 app.use(bodyParser.json());
 
-// Environment variables & network binding
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ponte_concierge_secure_token';
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || 'your_meta_permanent_access_token';
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || 'your_whatsapp_phone_number_id';
+const VERIFY_TOKEN = 'ponte_concierge_secure_token';
 
-// ==========================================
 // 1. WEBHOOK VERIFICATION (GET /webhook)
-// ==========================================
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -29,59 +23,58 @@ app.get('/webhook', (req, res) => {
       res.sendStatus(403);
     }
   } else {
-    res.sendStatus(400);
+    res.sendStatus(403);
   }
 });
 
-// ==========================================
 // 2. EVENT LISTENER & ROUTER (POST /webhook)
-// ==========================================
 app.post('/webhook', async (req, res) => {
   const body = req.body;
-res.sendStatus(200);
+  res.sendStatus(200);
+
   if (body.object === 'whatsapp_business_account') {
     for (const entry of body.entry) {
       for (const change of entry.changes) {
         const value = change.value;
-        
+
         if (value && value.messages && value.messages.length > 0) {
           const message = value.messages[0];
           const senderPhone = message.from;
           const messageId = message.id;
-          
+
           console.log(`Received message from ${senderPhone} (ID: ${messageId})`);
 
-         // Direct Text Messages
-        if (message.type === 'text') {
-          const messageBody = message.body.text.body.toLowerCase().trim();
-          console.log(`Text Content: "${messageBody}"`);
-          
-          if (messageBody.includes('parcel') || messageBody.includes('fetch')) {
-            await sendWhatsAppFlow(
-              senderPhone, 
-              "2210586496532912", // Your Package Collect / Parcel Fetch Flow ID
-              "PARCEL_DETAILS", 
-              "Fetch Parcel", 
-              "Tap below to request a parcel runner."
-            );
-          } else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
-            await sendWhatsAppFlow(
-              senderPhone, 
-              "259347371166581", // Your Visitor Pass Flow ID
-              "VISITOR_INFO", 
-              "Issue Pass", 
-              "Tap below to pre-clear a visitor."
-            );
-          } else {
-            await sendWhatsAppMessage(
-              senderPhone,
-              `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
-            );
+          // Direct Text Messages
+          if (message.type === 'text') {
+            const messageBody = message.text.body.toLowerCase().trim();
+            console.log(`Text Content: "${messageBody}"`);
+
+            if (messageBody.includes('parcel') || messageBody.includes('fetch') || messageBody.includes('collect')) {
+              await sendWhatsAppFlow(
+                senderPhone, 
+                "2210586496532912", // Package Collect Flow ID
+                "PARCEL_DETAILS", 
+                "Fetch Parcel", 
+                "Tap below to request a parcel runner."
+              );
+            } else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
+              await sendWhatsAppFlow(
+                senderPhone, 
+                "2593473711166581", // Visitor Pass Flow ID
+                "VISITOR_INFO", 
+                "Issue Pass", 
+                "Tap below to pre-clear a visitor."
+              );
+            } else {
+              await sendWhatsAppMessage(
+                senderPhone,
+                `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
+              );
+            }
           }
-        }
 
           // Interactive Flow Responses
-          } else if (message.type === 'interactive') {
+          else if (message.type === 'interactive') {
             const interactiveType = message.interactive.type;
             console.log(`Interactive Type: ${interactiveType}`);
 
@@ -89,22 +82,20 @@ res.sendStatus(200);
               const responseJson = JSON.parse(message.interactive.nfm_reply.response_json);
               console.log('Flow Response Payload:', responseJson);
 
-              // Route 1: Parcel Fetch Flow Submission
+              // Package Collect / Parcel Fetch Flow Submission
               if (responseJson.unit_number) {
                 console.log(`📦 Parcel Request - Unit: ${responseJson.unit_number}, Courier: ${responseJson.courier_name}`);
-                
                 await sendWhatsAppMessage(
-                  senderPhone, 
-                  `📦 *Runner Dispatched!*\n\nUnit: ${responseJson.unit_number}\nCourier: ${responseJson.courier_name}\nNotes: ${responseJson.special_instructions || 'None'}\n\nOur concierge runner is retrieving your package now.`
+                  senderPhone,
+                  `Success! Runner dispatched to unit ${responseJson.unit_number} for ${responseJson.courier_name}.`
                 );
-
-              // Route 2: Visitor Pass Flow Submission
-              } else if (responseJson.visitor_name) {
-                console.log(`🎫 Visitor Pass - Name: ${responseJson.visitor_name}, Access: ${responseJson.entry_type}`);
-                
+              } 
+              // Visitor Pass Flow Submission
+              else if (responseJson.visitor_name) {
+                console.log(`🎫 Visitor Pass - Name: ${responseJson.visitor_name}, Type: ${responseJson.entry_type}`);
                 await sendWhatsAppMessage(
-                  senderPhone, 
-                  `🎫 *Gate Pass Approved!*\n\nVisitor: ${responseJson.visitor_name}\nType: ${responseJson.entry_type}\nVehicle: ${responseJson.vehicle_reg || 'N/A'}\n\nSecurity at the entry gate has been notified. Your visitor is pre-cleared.`
+                  senderPhone,
+                  `Gate pass generated for ${responseJson.visitor_name} (${responseJson.entry_type}). Security notified.`
                 );
               }
             }
@@ -112,22 +103,19 @@ res.sendStatus(200);
         }
       }
     }
-    return res.status(200).send('EVENT_RECEIVED');
-  } else {
-    return res.sendStatus(404);
   }
 });
-// Health check route to clear "Cannot GET /"
+
+// Health check route
 app.get('/', (req, res) => {
   return res.status(200).send('Ponte Concierge Webhook Service is Active 🚀');
 });
-// ==========================================
+
 // 3. HELPER: SEND WHATSAPP MESSAGE
-// ==========================================
 async function sendWhatsAppMessage(recipientPhone, messageText) {
   try {
     await axios.post(
-      `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+      `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`,
       {
         messaging_product: 'whatsapp',
         to: recipientPhone,
@@ -136,7 +124,7 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
       },
       {
         headers: {
-          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
           'Content-Type': 'application/json',
         },
       }
@@ -146,6 +134,7 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
     console.error('Error sending WhatsApp message:', error.response?.data || error.message);
   }
 }
+
 // 4. HELPER: SEND WHATSAPP FLOW
 async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bodyText) {
   const token = process.env.WHATSAPP_TOKEN;
@@ -185,6 +174,7 @@ async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bod
 
   return await response.json();
 }
+
 // Start Server
 app.listen(PORT, HOST, () => {
   console.log(`Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
