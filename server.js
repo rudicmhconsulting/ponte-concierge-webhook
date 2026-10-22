@@ -126,7 +126,45 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
     console.error('Error sending WhatsApp message:', error.response?.data || error.message);
   }
 }
+// 4. HELPER: SEND WHATSAPP FLOW
+async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bodyText) {
+  const token = process.env.WHATSAPP_TOKEN;
+  const phoneId = process.env.PHONE_NUMBER_ID;
 
+  const url = `https://graph.facebook.com/v18.0/${phoneId}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to: recipientPhone,
+    type: "interactive",
+    interactive: {
+      type: "flow",
+      body: { text: bodyText },
+      action: {
+        name: "flow",
+        parameters: {
+          flow_message_version: "3",
+          flow_id: flowId,
+          flow_cta: ctaText,
+          flow_action: "navigate",
+          flow_action_payload: {
+            screen: screenName
+          }
+        }
+      }
+    }
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  return await response.json();
+}
 // Start Server
 app.listen(PORT, HOST, () => {
   console.log(`Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
