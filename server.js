@@ -1,6 +1,5 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const axios = require('axios');
 
 const app = express();
 app.use(bodyParser.json());
@@ -29,12 +28,10 @@ app.get('/webhook', (req, res) => {
 
 // 2. EVENT LISTENER & ROUTER (POST /webhook)
 app.post('/webhook', async (req, res) => {
-  // ALWAYS respond with 200 OK immediately to satisfy Meta
   res.sendStatus(200);
 
   try {
     const body = req.body;
-    console.log('📥 Incoming Webhook Payload:', JSON.stringify(body, null, 2));
 
     if (body.object === 'whatsapp_business_account') {
       for (const entry of body.entry) {
@@ -44,8 +41,6 @@ app.post('/webhook', async (req, res) => {
           if (value && value.messages && value.messages.length > 0) {
             const message = value.messages[0];
             const senderPhone = message.from;
-
-            console.log(`📩 Received message type [${message.type}] from ${senderPhone}`);
 
             // Direct Text Messages
             if (message.type === 'text') {
@@ -71,7 +66,6 @@ app.post('/webhook', async (req, res) => {
                   "Tap below to pre-clear a visitor."
                 );
               } else {
-                console.log('ℹ️ Sending fallback help text.');
                 await sendWhatsAppMessage(
                   senderPhone,
                   `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
@@ -82,26 +76,21 @@ app.post('/webhook', async (req, res) => {
             // Interactive Flow Responses (Form Submissions)
             else if (message.type === 'interactive') {
               const interactiveType = message.interactive.type;
-              console.log(`🔀 Interactive Type: ${interactiveType}`);
 
               if (interactiveType === 'nfm_reply') {
                 const responseJson = JSON.parse(message.interactive.nfm_reply.response_json);
-                console.log('📋 Flow Response Payload:', responseJson);
 
-                // Package Collect / Parcel Fetch Flow Submission
                 if (responseJson.unit_number) {
-                  console.log(`✅ Parcel Request Logged - Unit: ${responseJson.unit_number}, Courier: ${responseJson.courier_name}`);
+                  console.log(`✅ Parcel Request Logged - Unit: ${responseJson.unit_number}`);
                   await sendWhatsAppMessage(
                     senderPhone,
                     `Success! Runner dispatched to unit ${responseJson.unit_number} for ${responseJson.courier_name}.`
                   );
-                } 
-                // Visitor Pass Flow Submission
-                else if (responseJson.visitor_name) {
-                  console.log(`✅ Visitor Pass Logged - Name: ${responseJson.visitor_name}, Type: ${responseJson.entry_type}`);
+                } else if (responseJson.visitor_name) {
+                  console.log(`✅ Visitor Pass Logged - Name: ${responseJson.visitor_name}`);
                   await sendWhatsAppMessage(
                     senderPhone,
-                    `Gate pass generated for ${responseJson.visitor_name} (${responseJson.entry_type}). Security notified.`
+                    `Gate pass generated for ${responseJson.visitor_name}. Security notified.`
                   );
                 }
               }
@@ -123,41 +112,36 @@ app.get('/', (req, res) => {
 // 3. HELPER: SEND TEXT MESSAGE
 async function sendWhatsAppMessage(recipientPhone, messageText) {
   try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`,
-      {
+    await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
         messaging_product: 'whatsapp',
         to: recipientPhone,
         type: 'text',
         text: { body: messageText },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.PHONE_NUMBER_TOKEN || process.env.WHATSAPP_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
+      }),
+    });
     console.log(`📤 Text reply sent successfully to ${recipientPhone}`);
   } catch (error) {
-    console.error('❌ Error sending WhatsApp message:', error.response?.data || error.message);
+    console.error('❌ Error sending WhatsApp message:', error.message);
   }
 }
 
 // 4. HELPER: SEND WHATSAPP FLOW
 async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bodyText) {
   try {
-    const token = process.env.WHATSAPP_TOKEN;
-    const phoneId = process.env.PHONE_NUMBER_ID;
-
-    const url = `https://graph.facebook.com/v18.0/${phoneId}/messages`;
+    const url = `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`;
     const payload = {
       messaging_product: "whatsapp",
       to: recipientPhone,
       type: "interactive",
       interactive: {
         type: "flow",
-      body: { text: bodyText },
+        body: { text: bodyText },
         action: {
           name: "flow",
           parameters: {
@@ -173,17 +157,20 @@ async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bod
       }
     };
 
-    const response = await axios.post(url, payload, {
+    const response = await fetch(url, {
+      method: "POST",
       headers: {
-        "Authorization": `Bearer ${token}`,
+        "Authorization": `Bearer ${process.env.WHATSAPP_TOKEN}`,
         "Content-Type": "application/json"
-      }
+      },
+      body: JSON.stringify(payload)
     });
 
+    const data = await response.json();
     console.log(`📤 Flow message sent successfully to ${recipientPhone}`);
-    return response.data;
+    return data;
   } catch (error) {
-    console.error('❌ Error sending WhatsApp Flow:', error.response?.data || error.message);
+    console.error('❌ Error sending WhatsApp Flow:', error.message);
   }
 }
 
