@@ -8,6 +8,9 @@ const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
 const VERIFY_TOKEN = 'ponte_concierge_secure_token';
 
+// In-memory state machine for runner assignments during SIT
+const activeJobs = new Map();
+
 // 1. WEBHOOK VERIFICATION (GET /webhook)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -16,7 +19,7 @@ app.get('/webhook', (req, res) => {
 
   if (mode && token) {
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-      console.log('WEBHOOK_VERIFIED');
+      console.log('✅ WEBHOOK_VERIFIED');
       return res.status(200).send(challenge);
     } else {
       return res.sendStatus(403);
@@ -28,45 +31,81 @@ app.get('/webhook', (req, res) => {
 
 // 2. EVENT LISTENER & ROUTER (POST /webhook)
 app.post('/webhook', async (req, res) => {
+  // Acknowledge receipt to Meta immediately so they don't retry
   res.sendStatus(200);
-  return; // Terminate immediately to prevent header conflicts
 
   try {
     const body = req.body;
     if (body.object === 'whatsapp_business_account') {
-      for (const entry of body.entry) {
-        for (const change of entry.changes) {
+      for (const entry of body.entry || []) {
+        for (const change of entry.changes || []) {
           const value = change.value;
 
           if (value && value.messages && value.messages.length > 0) {
             const message = value.messages[0];
             const senderPhone = message.from;
 
-            // Direct Text Messages
-            if (message.type === 'text') {
-              const messageBody = message.text.body.toLowerCase().trim();
-              console.log(`💬 Text Content: "${messageBody}"`);
+            // --- CASE A: RUNNER CLICKED AN INTERACTIVE BUTTON ---
+            if (message.type === 'interactive' && message.interactive?.type === 'button_reply') {
+              const buttonId = message.interactive.button_reply.id;
+              console.log(`🔘 Button clicked by ${senderPhone}: ${buttonId}`);
 
-              if (messageBody.includes('parcel') || messageBody.includes('fetch') || messageBody.includes('collect')) {
-                await sendWhatsAppFlow(
-                  senderPhone, 
-                  "2210586496532912", 
-                  "PARCEL_DETAILS", 
-                  "Fetch Parcel", 
-                  "Tap below to request a parcel runner."
-                );
-              } else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
-                await sendWhatsAppFlow(
-                  senderPhone, 
-                  "2593473711166581", 
-                  "VISITOR_INFO", 
-                  "Issue Pass", 
-                  "Tap below to pre-clear a visitor."
-                );
-              } else {
+              if (buttonId.startsWith('JOB_ACCEPT_')) {
+                const jobId = buttonId.replace('JOB_ACCEPT_', '');
+                const job = activeJobs.get(jobId);
+
+                if (!job) {
+                  await sendWhatsAppMessage(senderPhone, `⚠️ Job #${jobId} is no longer available.`);
+                  return;
+                }
+
+                if (job.status === 'ASSIGNED') {
+                  await sendWhatsAppMessage(senderPhone, `❌ Snooze you lose! Job #${jobId} was already claimed.`);
+                  return;
+                }
+
+                job.status = 'ASSIGNED';
+                job.runner = senderPhone;
+                activeJobs.set(jobId, job);
+
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `Ponte Concierge received: "${messageBody}". Type 'parcel' to fetch a package or 'pass' for a visitor pass.`
+                  `✅ *Job #${jobId} Confirmed!*\n\nHead to Reception and present token: *[PK-${jobId}]* to collect the parcel for *Unit ${job.unit}*.\n\n💰 R${job.payout.toFixed(2)} will be credited upon delivery.`
+                );
+              } else if (buttonId.startsWith('JOB_DECLINE_')) {
+                await sendWhatsAppMessage(senderPhone, `👍 Job declined. You remain on the active runner roster.`);
+              }
+              return;
+            }
+
+            // --- CASE B: DIRECT TEXT MESSAGES ---
+            if (message.type === 'text') {
+              const messageBody = message.text.body.toLowerCase().trim();
+              console.log(`💬 Inbound text from ${senderPhone}: "${messageBody}"`);
+
+              // Test runner dispatch
+              if (messageBody === 'run' || messageBody === 'testjob') {
+                const testId = Math.floor(1000 + Math.random() * 9000).toString();
+                const newJob = {
+                  id: testId,
+                  unit: '3204',
+                  courier: 'Takealot',
+                  payout: 25.00,
+                  status: 'OPEN'
+                };
+                activeJobs.set(testId, newJob);
+                await sendRunnerJob(senderPhone, newJob);
+              } 
+              else if (messageBody.includes('pass') || messageBody.includes('visitor')) {
+                await sendWhatsAppMessage(
+                  senderPhone,
+                  `🛡️ *Ponte Visitor Pre-Clearance*\n\nPlease reply with your guest's *Full Name* and *Access Type* (e.g. Sipho Dlamini, Pedestrian).`
+                );
+              } 
+              else {
+                await sendWhatsAppMessage(
+                  senderPhone,
+                  `👋 *Welcome to Ponte Concierge!*\n\n• Text *run* to test the Runner Dispatch Job Box\n• Text *visitor* for visitor gate clearance\n• Text *parcel* to check arriving couriers`
                 );
               }
             }
@@ -87,7 +126,7 @@ app.get('/', (req, res) => {
 // 3. HELPER: SEND TEXT MESSAGE
 async function sendWhatsAppMessage(recipientPhone, messageText) {
   try {
-    await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+    const response = await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
@@ -100,49 +139,72 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
         text: { body: messageText },
       }),
     });
+    const data = await response.json();
+    return data;
   } catch (error) {
     console.error('❌ Error sending WhatsApp message:', error.message);
   }
 }
 
-// 4. HELPER: SEND WHATSAPP FLOW
-async function sendWhatsAppFlow(recipientPhone, flowId, screenName, ctaText, bodyText) {
+// 4. HELPER: SEND RUNNER JOB BOX (NATIVE BUTTONS)
+async function sendRunnerJob(runnerPhone, job) {
   try {
-    const url = `https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`;
     const payload = {
-      messaging_product: "whatsapp",
-      to: recipientPhone,
-      type: "interactive",
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: runnerPhone,
+      type: 'interactive',
       interactive: {
-        type: "flow",
-        body: { text: bodyText },
+        type: 'button',
+        header: {
+          type: 'text',
+          text: '📦 PONTE CONCIERGE RUNNER'
+        },
+        body: {
+          text: `*New Task Available!*\n\n` +
+                `• *Job ID:* #${job.id}\n` +
+                `• *Pickup:* Reception Desk\n` +
+                `• *Destination:* Unit ${job.unit}\n` +
+                `• *Courier/Item:* ${job.courier}\n` +
+                `• *Payout:* R${job.payout.toFixed(2)}`
+        },
+        footer: {
+          text: 'Tap to claim — first to accept gets the run.'
+        },
         action: {
-          name: "flow",
-          parameters: {
-            flow_message_version: "3",
-            flow_id: flowId,
-            flow_cta: ctaText,
-            flow_action: "navigate",
-            flow_action_payload: {
-              screen: screenName
+          buttons: [
+            {
+              type: 'reply',
+              reply: {
+                id: `JOB_ACCEPT_${job.id}`,
+                title: 'Accept Run 🚀'
+              }
+            },
+            {
+              type: 'reply',
+              reply: {
+                id: `JOB_DECLINE_${job.id}`,
+                title: 'Decline'
+              }
             }
-          }
+          ]
         }
       }
     };
 
-    const response = await fetch(url, {
-      method: "POST",
+    const response = await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
       headers: {
-        "Authorization": `Bearer ${process.env.WHATSAPP_TOKEN}`,
-        "Content-Type": "application/json"
+        'Authorization': `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload)
     });
-
-    return await response.json();
+    const data = await response.json();
+    console.log(`📦 Dispatched Job #${job.id} to ${runnerPhone}`);
+    return data;
   } catch (error) {
-    console.error('❌ Error sending WhatsApp Flow:', error.message);
+    console.error('❌ Error sending Runner Job:', error.message);
   }
 }
 
