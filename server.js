@@ -8,24 +8,19 @@ const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
 const VERIFY_TOKEN = 'ponte_concierge_secure_token';
 
-// In-memory state tracking for SIT demonstration
+// State machines
 const activeJobs = new Map();
-const visitorSessions = new Map();
+const residentSessions = new Map(); // Keyed by resident phone
+const visitorRegistrations = new Map(); // Keyed by visitor phone
 
-// =================================================================
-// 1. UTILITIES & COMPLIANCE ALGORITHMS
-// =================================================================
-
+// --- 1. UTILITIES ---
 function validateSouthAfricanID(id) {
   const cleanId = id.replace(/\s+/g, '').replace(/-/g, '');
   if (!/^\d{13}$/.test(cleanId)) return false;
 
-  const year = parseInt(cleanId.substring(0, 2), 10);
   const month = parseInt(cleanId.substring(2, 4), 10);
   const day = parseInt(cleanId.substring(4, 6), 10);
-
-  if (month < 1 || month > 12) return false;
-  if (day < 1 || day > 31) return false;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
 
   let sum = 0;
   for (let i = 0; i < 13; i++) {
@@ -47,29 +42,28 @@ function maskIdNumber(id) {
   return clean.length > 4 ? `${clean.substring(0, 2)}***${clean.slice(-2)}` : '***';
 }
 
-// =================================================================
-// 2. WEBHOOK VERIFICATION (GET /webhook)
-// =================================================================
+function normalizePhone(phone) {
+  let clean = phone.replace(/\D/g, '');
+  if (clean.startsWith('0') && clean.length === 10) {
+    clean = '27' + clean.substring(1);
+  }
+  return clean;
+}
 
+// --- 2. GET /webhook ---
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode && token) {
-    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-      console.log('✅ WEBHOOK_VERIFIED');
-      return res.status(200).send(challenge);
-    }
-    return res.sendStatus(403);
+  if (mode && token && mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('✅ WEBHOOK_VERIFIED');
+    return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
 });
 
-// =================================================================
-// 3. EVENT ROUTER & WEBHOOK LISTENER (POST /webhook)
-// =================================================================
-
+// --- 3. POST /webhook ---
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
@@ -85,19 +79,19 @@ app.post('/webhook', async (req, res) => {
             const senderPhone = message.from;
 
             // -------------------------------------------------------------
-            // CASE A: INTERACTIVE BUTTON CALLBACKS
+            // INTERACTIVE BUTTON REPLIES
             // -------------------------------------------------------------
             if (message.type === 'interactive' && message.interactive?.type === 'button_reply') {
               const buttonId = message.interactive.button_reply.id;
-              console.log(`🔘 Button Clicked by ${senderPhone}: ${buttonId}`);
+              console.log(`🔘 Button from ${senderPhone}: ${buttonId}`);
 
-              // 1. Runner Job Claim
+              // Runner Claim
               if (buttonId.startsWith('JOB_ACCEPT_')) {
                 const jobId = buttonId.replace('JOB_ACCEPT_', '');
                 const job = activeJobs.get(jobId);
 
                 if (!job || job.status === 'ASSIGNED') {
-                  await sendWhatsAppMessage(senderPhone, `❌ Snooze you lose! Job #${jobId} was already claimed.`);
+                  await sendWhatsAppMessage(senderPhone, `❌ Job #${jobId} already claimed.`);
                   return;
                 }
 
@@ -107,144 +101,162 @@ app.post('/webhook', async (req, res) => {
 
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `✅ *Job #${jobId} Confirmed!*\n\nHead to Reception and present token: *[PK-${jobId}]* for Unit ${job.unit}.\n💰 R${job.payout.toFixed(2)} credited upon delivery verification.`
+                  `✅ *Job #${jobId} Confirmed!*\n\nPresent token *[PK-${jobId}]* at Reception for Unit ${job.unit}.\n💰 R${job.payout.toFixed(2)} logged.`
                 );
                 return;
               }
 
-              // 2. Runner Job Decline
-              if (buttonId.startsWith('JOB_DECLINE_')) {
-                await sendWhatsAppMessage(senderPhone, `👍 Job declined. You remain active on the standby runner roster.`);
-                return;
-              }
-
-              // 3. Visitor Access Type Selection
+              // Resident selects access type for visitor
               if (buttonId.startsWith('ACCESS_TYPE_')) {
-                const session = visitorSessions.get(senderPhone);
+                const session = residentSessions.get(senderPhone);
                 if (!session) {
                   await sendWhatsAppMessage(senderPhone, `⚠️ Session expired. Type *visitor* to restart.`);
                   return;
                 }
 
                 session.accessType = buttonId.replace('ACCESS_TYPE_', '');
-                session.step = 'AWAITING_ID_DOC';
-                visitorSessions.set(senderPhone, session);
+                residentSessions.delete(senderPhone);
 
+                // Initialize registration session on the VISITOR's phone
+                visitorRegistrations.set(session.visitorPhone, {
+                  visitorName: session.visitorName,
+                  hostPhone: senderPhone,
+                  accessType: session.accessType,
+                  step: 'AWAITING_ID_NUMBER'
+                });
+
+                // 1. Confirm to Resident
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `📸 *Identity Document Verification*\n\nPlease take a clear photo or upload an image of *${session.visitorName}*'s SA ID Card / Book, Driver's License, or Passport.\n\n_Note: Personal document images are cached temporarily for access compliance and purged per POPIA standards._`
+                  `✅ *Pre-Clearance Initiated!*\n\nAn identity verification request was sent to *${session.visitorName}* (+${session.visitorPhone}).\nTheir 24h pass will be generated once verified.`
+                );
+
+                // 2. Dispatch Invitation to Visitor
+                await sendWhatsAppMessage(
+                  session.visitorPhone,
+                  `👋 *Hello ${session.visitorName}!*\n\nYou have been invited to *Ponte City* by a resident.\n\n` +
+                  `To issue your secure 24-hour gate pass, please reply with your *13-digit SA ID Number* or *Passport Number*:`
                 );
                 return;
               }
             }
 
             // -------------------------------------------------------------
-            // CASE B: INBOUND IMAGES (DOCUMENT CAPTURE)
+            // DOCUMENT IMAGE UPLOAD (BY VISITOR)
             // -------------------------------------------------------------
             if (message.type === 'image') {
-              const session = visitorSessions.get(senderPhone);
-              if (session && session.step === 'AWAITING_ID_DOC') {
-                const imageId = message.image.id;
-                console.log(`📸 Document image received (Media ID: ${imageId}) for visitor: ${session.visitorName}`);
+              const vReg = visitorRegistrations.get(senderPhone);
+              if (vReg && vReg.step === 'AWAITING_DOC_IMAGE') {
+                console.log(`📸 Document image uploaded by visitor: ${vReg.visitorName}`);
 
-                session.documentMediaId = imageId;
-                session.step = 'COMPLETED';
+                vReg.documentMediaId = message.image.id;
+                vReg.step = 'COMPLETED';
 
-                // Try Plan C Tunnel if available; otherwise fallback to Mock Pass
-                await issueVisitorPass(senderPhone, session);
-                visitorSessions.delete(senderPhone);
+                // Issue Pass directly to the visitor
+                await issueVisitorPass(senderPhone, vReg);
+
+                // Alert the resident that their guest is cleared
+                await sendWhatsAppMessage(
+                  vReg.hostPhone,
+                  `🔔 *Visitor Cleared!*\n\n*${vReg.visitorName}* uploaded identity verification. A 24-hour multi-entry gate pass has been delivered to their device.`
+                );
+
+                visitorRegistrations.delete(senderPhone);
                 return;
               }
             }
 
             // -------------------------------------------------------------
-            // CASE C: DIRECT INBOUND TEXT MESSAGES
+            // TEXT MESSAGES
             // -------------------------------------------------------------
             if (message.type === 'text') {
               const rawText = message.text.body.trim();
               const lowerText = rawText.toLowerCase();
-              console.log(`💬 Inbound text from ${senderPhone}: "${rawText}"`);
 
-              const session = visitorSessions.get(senderPhone);
+              // Check if the sender is a VISITOR completing identity capture
+              const vReg = visitorRegistrations.get(senderPhone);
+              if (vReg && vReg.step === 'AWAITING_ID_NUMBER') {
+                const idCandidate = rawText.replace(/\s+/g, '');
 
-              // Step: Capturing Visitor Name and ID
-              if (session && session.step === 'AWAITING_DETAILS') {
-                const parts = rawText.split(',');
-                if (parts.length < 2) {
-                  await sendWhatsAppMessage(
-                    senderPhone,
-                    `⚠️ *Format Error*\nPlease supply both Name and ID separated by a comma.\n\n*Example:* Sipho Dlamini, 8502145028081`
-                  );
-                  return;
-                }
-
-                const visitorName = parts[0].trim();
-                const idCandidate = parts[1].trim();
-
-                // If numeric, check length & Luhn
                 if (/^\d+$/.test(idCandidate)) {
                   if (idCandidate.length === 13) {
                     if (!validateSouthAfricanID(idCandidate)) {
                       await sendWhatsAppMessage(
                         senderPhone,
-                        `❌ *Invalid SA ID Number*\nThe ID number provided failed Luhn checksum verification. Please re-enter a valid 13-digit SA ID number or Passport.`
+                        `❌ *Invalid SA ID Number*\nChecksum failed. Please reply with a valid 13-digit SA ID number or foreign passport.`
                       );
                       return;
                     }
                   } else {
                     await sendWhatsAppMessage(
                       senderPhone,
-                      `❌ *Invalid ID Length*\nSA ID must be 13 digits. For foreign passports, include alpha prefix (e.g. A01234567).`
+                      `❌ *Invalid ID Length*\nSA ID must be 13 digits. Foreign passports must include alphanumeric prefix.`
                     );
                     return;
                   }
                 }
 
-                session.visitorName = visitorName;
-                session.idNumber = idCandidate;
-                session.step = 'AWAITING_ACCESS_TYPE';
-                visitorSessions.set(senderPhone, session);
+                vReg.idNumber = idCandidate;
+                vReg.step = 'AWAITING_DOC_IMAGE';
+                visitorRegistrations.set(senderPhone, vReg);
+
+                await sendWhatsAppMessage(
+                  senderPhone,
+                  `📸 *ID Document Required*\n\nPlease upload a photo of your *ID Card / Book, Driver's License, or Passport* to finalize your 24-hour pass.\n\n_Note: Images are cached temporarily for access control and purged per POPIA requirements._`
+                );
+                return;
+              }
+
+              // Check if the sender is a RESIDENT entering visitor info
+              const rSession = residentSessions.get(senderPhone);
+              if (rSession && rSession.step === 'AWAITING_NAME_AND_CELL') {
+                const parts = rawText.split(',');
+                if (parts.length < 2) {
+                  await sendWhatsAppMessage(
+                    senderPhone,
+                    `⚠️ *Format Error*\nPlease supply Visitor Name and Mobile Number separated by a comma.\n\n*Example:* Sipho Dlamini, 0821234567`
+                  );
+                  return;
+                }
+
+                const visitorName = parts[0].trim();
+                const visitorPhone = normalizePhone(parts[1].trim());
+
+                if (visitorPhone.length < 10) {
+                  await sendWhatsAppMessage(
+                    senderPhone,
+                    `⚠️ *Invalid Mobile Number*\nPlease check the cell number provided.`
+                  );
+                  return;
+                }
+
+                rSession.visitorName = visitorName;
+                rSession.visitorPhone = visitorPhone;
+                rSession.step = 'AWAITING_ACCESS_TYPE';
+                residentSessions.set(senderPhone, rSession);
 
                 await sendAccessTypeButtons(senderPhone, visitorName);
                 return;
               }
 
-              // Top-level commands
+              // General Commands
               if (lowerText === 'run' || lowerText === 'testjob') {
                 const testId = Math.floor(1000 + Math.random() * 9000).toString();
-                const newJob = {
-                  id: testId,
-                  unit: '3204',
-                  courier: 'Takealot',
-                  payout: 25.00,
-                  status: 'OPEN'
-                };
+                const newJob = { id: testId, unit: '3204', courier: 'Takealot', payout: 25.00, status: 'OPEN' };
                 activeJobs.set(testId, newJob);
                 await sendRunnerJob(senderPhone, newJob);
               } 
               else if (lowerText.includes('pass') || lowerText.includes('visitor')) {
-                visitorSessions.set(senderPhone, { step: 'AWAITING_DETAILS' });
+                residentSessions.set(senderPhone, { step: 'AWAITING_NAME_AND_CELL' });
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `🛡️ *Ponte Visitor Pre-Clearance (24h Pass)*\n\nPlease reply with your guest's *Full Name* and *ID/Passport Number* separated by a comma:\n\n*Example:* Sipho Dlamini, 9001015028087`
+                  `🛡️ *Ponte Visitor Pre-Clearance*\n\nPlease reply with your guest's *Full Name* and *Mobile Number* separated by a comma:\n\n*Example:* Sipho Dlamini, 0821234567`
                 );
-              } 
-              else if (lowerText.includes('parcel') || lowerText.includes('fetch') || lowerText.includes('collect')) {
-                const testId = Math.floor(1000 + Math.random() * 9000).toString();
-                const newJob = {
-                  id: testId,
-                  unit: 'Current Resident',
-                  courier: 'Reception Parcel Desk',
-                  payout: 25.00,
-                  status: 'OPEN'
-                };
-                activeJobs.set(testId, newJob);
-                await sendRunnerJob(senderPhone, newJob);
               } 
               else {
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `👋 *Welcome to Ponte Concierge!*\n\n• Text *run* to test the Runner Dispatch Job Box\n• Text *visitor* for 24h ID-verified visitor clearance\n• Text *parcel* to request an apartment runner`
+                  `👋 *Welcome to Ponte Concierge!*\n\n• Text *run* to test the Runner Dispatch Job Box\n• Text *visitor* to invite a guest & issue a 24h pass`
                 );
               }
             }
@@ -253,19 +265,14 @@ app.post('/webhook', async (req, res) => {
       }
     }
   } catch (err) {
-    console.error('❌ Webhook Router Exception:', err);
+    console.error('❌ Webhook Error:', err);
   }
 });
 
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.status(200).send('Ponte Concierge Webhook Service is Active 🚀');
-});
+// Health check
+app.get('/', (req, res) => res.status(200).send('Ponte Concierge Webhook Service Active 🚀'));
 
-// =================================================================
-// 4. OUTBOUND MESSAGING HELPERS
-// =================================================================
-
+// --- 4. HELPERS ---
 async function sendWhatsAppMessage(recipientPhone, messageText) {
   try {
     const response = await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
@@ -283,7 +290,7 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending text message:', error.message);
+    console.error('❌ Error sending WhatsApp message:', error.message);
   }
 }
 
@@ -297,7 +304,7 @@ async function sendAccessTypeButtons(recipientPhone, visitorName) {
       interactive: {
         type: 'button',
         header: { type: 'text', text: '🛡️ SELECT ACCESS TYPE' },
-        body: { text: `Pre-clearing pass for *${visitorName}*.\nSelect transport method for turnstile/boom access:` },
+        body: { text: `Select arrival mode for *${visitorName}*:` },
         action: {
           buttons: [
             { type: 'reply', reply: { id: 'ACCESS_TYPE_PEDESTRIAN', title: '🚶 Pedestrian' } },
@@ -318,7 +325,7 @@ async function sendAccessTypeButtons(recipientPhone, visitorName) {
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending access type buttons:', error.message);
+    console.error('❌ Error sending access buttons:', error.message);
   }
 }
 
@@ -335,15 +342,12 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, captionText) {
         recipient_type: 'individual',
         to: recipientPhone,
         type: 'image',
-        image: {
-          link: imageUrl,
-          caption: captionText,
-        },
+        image: { link: imageUrl, caption: captionText },
       }),
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending image message:', error.message);
+    console.error('❌ Error sending image:', error.message);
   }
 }
 
@@ -358,12 +362,7 @@ async function sendRunnerJob(runnerPhone, job) {
         type: 'button',
         header: { type: 'text', text: '📦 PONTE CONCIERGE RUNNER' },
         body: {
-          text: `*New Task Available!*\n\n` +
-                `• *Job ID:* #${job.id}\n` +
-                `• *Pickup:* Reception Desk\n` +
-                `• *Destination:* Unit ${job.unit}\n` +
-                `• *Courier/Item:* ${job.courier}\n` +
-                `• *Payout:* R${job.payout.toFixed(2)}`,
+          text: `*New Task Available!*\n\n• *Job ID:* #${job.id}\n• *Pickup:* Reception Desk\n• *Destination:* Unit ${job.unit}\n• *Courier/Item:* ${job.courier}\n• *Payout:* R${job.payout.toFixed(2)}`,
         },
         footer: { text: 'Tap to claim — first to accept gets the run.' },
         action: {
@@ -385,18 +384,13 @@ async function sendRunnerJob(runnerPhone, job) {
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending runner dispatch card:', error.message);
+    console.error('❌ Error sending runner job:', error.message);
   }
 }
 
-// =================================================================
-// 5. TURNSTILE PASS DISPATCHER (LIVE TUNNEL OR MOCK FALLBACK)
-// =================================================================
-
 async function issueVisitorPass(recipientPhone, session) {
-  const tunnelBaseUrl = process.env.HIKCENTRAL_BASE_URL; // Configured during 12:00 Cloudflare run
+  const tunnelBaseUrl = process.env.HIKCENTRAL_BASE_URL;
 
-  // Default Mock Pass logic
   let passCode = `PONTE-${Math.floor(100000 + Math.random() * 900000)}`;
   let qrPayload = JSON.stringify({
     pass: passCode,
@@ -408,10 +402,9 @@ async function issueVisitorPass(recipientPhone, session) {
     issuedAt: new Date().toISOString()
   });
 
-  // If Cloudflare Tunnel is live, bridge to HikCentral OpenAPI
   if (tunnelBaseUrl && tunnelBaseUrl.startsWith('http')) {
     try {
-      console.log(`🔌 Attempting live HikCentral reservation via tunnel: ${tunnelBaseUrl}`);
+      console.log(`🔌 Bridging to HikCentral via tunnel: ${tunnelBaseUrl}`);
       const hcpResponse = await fetch(`${tunnelBaseUrl}/api/visitor/v1/visitor/reservation`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -427,8 +420,8 @@ async function issueVisitorPass(recipientPhone, session) {
         qrPayload = hcpData.data.qrCode;
         passCode = hcpData.data.visitorId || passCode;
       }
-    } catch (tunnelErr) {
-      console.warn('⚠️ HikCentral Tunnel call timed out/failed. Seamlessly falling back to Mock Pass.', tunnelErr.message);
+    } catch (err) {
+      console.warn('⚠️ Tunnel call failed; using mock pass fallback.', err.message);
     }
   }
 
@@ -444,11 +437,10 @@ async function issueVisitorPass(recipientPhone, session) {
     `• *Pass Code:* ${passCode}\n` +
     `• *Access Policy:* 24-Hour Multi-Entry (Anti-Passback Enforced)\n` +
     `• *Expires:* In 24 hours\n\n` +
-    `_Present this QR barcode to the turnstile optical reader or boom scanner. Personal document records are queued for automated POPIA purge within 24 hours._`
+    `_Present this QR barcode to optical turnstile / boom scanner. Personal document image queued for automated POPIA purge within 24 hours._`
   );
 }
 
-// Start Server
 app.listen(PORT, HOST, () => {
   console.log(`🚀 Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
 });
