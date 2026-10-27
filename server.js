@@ -8,12 +8,15 @@ const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
 const VERIFY_TOKEN = 'ponte_concierge_secure_token';
 
-// State machines
+// In-memory state tracking for SIT demonstration
 const activeJobs = new Map();
-const residentSessions = new Map(); // Keyed by resident phone
-const visitorRegistrations = new Map(); // Keyed by visitor phone
+const residentSessions = new Map(); // Keyed by resident mobile
+const visitorRegistrations = new Map(); // Keyed by visitor mobile
 
-// --- 1. UTILITIES ---
+// =================================================================
+// 1. UTILITIES & COMPLIANCE ALGORITHMS
+// =================================================================
+
 function validateSouthAfricanID(id) {
   const cleanId = id.replace(/\s+/g, '').replace(/-/g, '');
   if (!/^\d{13}$/.test(cleanId)) return false;
@@ -50,7 +53,10 @@ function normalizePhone(phone) {
   return clean;
 }
 
-// --- 2. GET /webhook ---
+// =================================================================
+// 2. WEBHOOK VERIFICATION (GET /webhook)
+// =================================================================
+
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -63,7 +69,10 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// --- 3. POST /webhook ---
+// =================================================================
+// 3. EVENT ROUTER & WEBHOOK LISTENER (POST /webhook)
+// =================================================================
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
@@ -79,19 +88,19 @@ app.post('/webhook', async (req, res) => {
             const senderPhone = message.from;
 
             // -------------------------------------------------------------
-            // INTERACTIVE BUTTON REPLIES
+            // CASE A: INTERACTIVE BUTTON CALLBACKS
             // -------------------------------------------------------------
             if (message.type === 'interactive' && message.interactive?.type === 'button_reply') {
               const buttonId = message.interactive.button_reply.id;
-              console.log(`🔘 Button from ${senderPhone}: ${buttonId}`);
+              console.log(`🔘 Button Clicked by ${senderPhone}: ${buttonId}`);
 
-              // Runner Claim
+              // 1. Runner Job Claim
               if (buttonId.startsWith('JOB_ACCEPT_')) {
                 const jobId = buttonId.replace('JOB_ACCEPT_', '');
                 const job = activeJobs.get(jobId);
 
                 if (!job || job.status === 'ASSIGNED') {
-                  await sendWhatsAppMessage(senderPhone, `❌ Job #${jobId} already claimed.`);
+                  await sendWhatsAppMessage(senderPhone, `❌ Snooze you lose! Job #${jobId} was already claimed.`);
                   return;
                 }
 
@@ -101,12 +110,18 @@ app.post('/webhook', async (req, res) => {
 
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `✅ *Job #${jobId} Confirmed!*\n\nPresent token *[PK-${jobId}]* at Reception for Unit ${job.unit}.\n💰 R${job.payout.toFixed(2)} logged.`
+                  `✅ *Job #${jobId} Confirmed!*\n\nHead to Reception and present token: *[PK-${jobId}]* for Unit ${job.unit}.\n💰 R${job.payout.toFixed(2)} credited upon delivery verification.`
                 );
                 return;
               }
 
-              // Resident selects access type for visitor
+              // 2. Runner Job Decline
+              if (buttonId.startsWith('JOB_DECLINE_')) {
+                await sendWhatsAppMessage(senderPhone, `👍 Job declined. You remain active on the standby runner roster.`);
+                return;
+              }
+
+              // 3. Resident Selects Access Type -> Hands off to Visitor
               if (buttonId.startsWith('ACCESS_TYPE_')) {
                 const session = residentSessions.get(senderPhone);
                 if (!session) {
@@ -117,7 +132,6 @@ app.post('/webhook', async (req, res) => {
                 session.accessType = buttonId.replace('ACCESS_TYPE_', '');
                 residentSessions.delete(senderPhone);
 
-                // Initialize registration session on the VISITOR's phone
                 visitorRegistrations.set(session.visitorPhone, {
                   visitorName: session.visitorName,
                   hostPhone: senderPhone,
@@ -125,24 +139,46 @@ app.post('/webhook', async (req, res) => {
                   step: 'AWAITING_ID_NUMBER'
                 });
 
-                // 1. Confirm to Resident
+                // Acknowledge Host Resident
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `✅ *Pre-Clearance Initiated!*\n\nAn identity verification request was sent to *${session.visitorName}* (+${session.visitorPhone}).\nTheir 24h pass will be generated once verified.`
+                  `✅ *Pre-Clearance Initiated!*\n\nIdentity verification link dispatched to *${session.visitorName}* (+${session.visitorPhone}).\nTheir 24h pass will issue once document verification completes.`
                 );
 
-                // 2. Dispatch Invitation to Visitor
+                // Dispatch Verification Prompt to Visitor
                 await sendWhatsAppMessage(
                   session.visitorPhone,
                   `👋 *Hello ${session.visitorName}!*\n\nYou have been invited to *Ponte City* by a resident.\n\n` +
-                  `To issue your secure 24-hour gate pass, please reply with your *13-digit SA ID Number* or *Passport Number*:`
+                  `To generate your secure 24-hour turnstile pass, please reply with your *13-digit SA ID Number* or *Passport Number*:`
                 );
+                return;
+              }
+
+              // 4. Registration Role Selection
+              if (buttonId.startsWith('ROLE_')) {
+                const role = buttonId.replace('ROLE_', '');
+                if (role === 'RESIDENT') {
+                  await sendWhatsAppMessage(
+                    senderPhone,
+                    `🏠 *Resident Registration*\n\nPlease reply with your *Unit Number* and *Full Name* (e.g. Unit 3204, Lindiwe Khumalo) to pair your profile with Ponte Concierge.`
+                  );
+                } else if (role === 'RUNNER') {
+                  await sendWhatsAppMessage(
+                    senderPhone,
+                    `🏃 *Runner Onboarding*\n\nYou are registered on the standby runner dispatch roster. When deliveries arrive at reception, you will receive interactive dispatch cards with delivery payouts.`
+                  );
+                } else if (role === 'VISITOR') {
+                  await sendWhatsAppMessage(
+                    senderPhone,
+                    `🛡️ *Visitor Access*\n\nVisitor passes must be pre-cleared by a registered Ponte resident. Ask your host resident to text *visitor* to this number to invite you.`
+                  );
+                }
                 return;
               }
             }
 
             // -------------------------------------------------------------
-            // DOCUMENT IMAGE UPLOAD (BY VISITOR)
+            // CASE B: INBOUND IMAGES (DOCUMENT CAPTURE BY VISITOR)
             // -------------------------------------------------------------
             if (message.type === 'image') {
               const vReg = visitorRegistrations.get(senderPhone);
@@ -167,11 +203,12 @@ app.post('/webhook', async (req, res) => {
             }
 
             // -------------------------------------------------------------
-            // TEXT MESSAGES
+            // CASE C: DIRECT INBOUND TEXT MESSAGES
             // -------------------------------------------------------------
             if (message.type === 'text') {
               const rawText = message.text.body.trim();
               const lowerText = rawText.toLowerCase();
+              console.log(`💬 Inbound text from ${senderPhone}: "${rawText}"`);
 
               // Check if the sender is a VISITOR completing identity capture
               const vReg = visitorRegistrations.get(senderPhone);
@@ -239,10 +276,19 @@ app.post('/webhook', async (req, res) => {
                 return;
               }
 
-              // General Commands
-              if (lowerText === 'run' || lowerText === 'testjob') {
+              // Top-level commands
+              if (lowerText === 'register' || lowerText === 'start') {
+                await sendRegistrationMenu(senderPhone);
+              }
+              else if (lowerText === 'run' || lowerText === 'testjob') {
                 const testId = Math.floor(1000 + Math.random() * 9000).toString();
-                const newJob = { id: testId, unit: '3204', courier: 'Takealot', payout: 25.00, status: 'OPEN' };
+                const newJob = {
+                  id: testId,
+                  unit: '3204',
+                  courier: 'Takealot',
+                  payout: 25.00,
+                  status: 'OPEN'
+                };
                 activeJobs.set(testId, newJob);
                 await sendRunnerJob(senderPhone, newJob);
               } 
@@ -250,13 +296,25 @@ app.post('/webhook', async (req, res) => {
                 residentSessions.set(senderPhone, { step: 'AWAITING_NAME_AND_CELL' });
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `🛡️ *Ponte Visitor Pre-Clearance*\n\nPlease reply with your guest's *Full Name* and *Mobile Number* separated by a comma:\n\n*Example:* Sipho Dlamini, 0821234567`
+                  `🛡️ *Ponte Visitor Pre-Clearance (24h Pass)*\n\nPlease reply with your guest's *Full Name* and *Mobile Number* separated by a comma:\n\n*Example:* Sipho Dlamini, 0821234567`
                 );
+              } 
+              else if (lowerText.includes('parcel') || lowerText.includes('fetch') || lowerText.includes('collect')) {
+                const testId = Math.floor(1000 + Math.random() * 9000).toString();
+                const newJob = {
+                  id: testId,
+                  unit: 'Current Resident',
+                  courier: 'Reception Parcel Desk',
+                  payout: 25.00,
+                  status: 'OPEN'
+                };
+                activeJobs.set(testId, newJob);
+                await sendRunnerJob(senderPhone, newJob);
               } 
               else {
                 await sendWhatsAppMessage(
                   senderPhone,
-                  `👋 *Welcome to Ponte Concierge!*\n\n• Text *run* to test the Runner Dispatch Job Box\n• Text *visitor* to invite a guest & issue a 24h pass`
+                  `👋 *Welcome to Ponte Concierge!*\n\n• Text *register* to launch onboarding\n• Text *run* to test the Runner Dispatch Job Box\n• Text *visitor* for 24h ID-verified visitor clearance\n• Text *parcel* to request an apartment runner`
                 );
               }
             }
@@ -265,14 +323,19 @@ app.post('/webhook', async (req, res) => {
       }
     }
   } catch (err) {
-    console.error('❌ Webhook Error:', err);
+    console.error('❌ Webhook Router Exception:', err);
   }
 });
 
-// Health check
-app.get('/', (req, res) => res.status(200).send('Ponte Concierge Webhook Service Active 🚀'));
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.status(200).send('Ponte Concierge Webhook Service is Active 🚀');
+});
 
-// --- 4. HELPERS ---
+// =================================================================
+// 4. OUTBOUND MESSAGING HELPERS
+// =================================================================
+
 async function sendWhatsAppMessage(recipientPhone, messageText) {
   try {
     const response = await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
@@ -290,7 +353,44 @@ async function sendWhatsAppMessage(recipientPhone, messageText) {
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending WhatsApp message:', error.message);
+    console.error('❌ Error sending text message:', error.message);
+  }
+}
+
+async function sendRegistrationMenu(recipientPhone) {
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipientPhone,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        header: { type: 'text', text: '🏢 PONTE CONCIERGE ONBOARDING' },
+        body: { 
+          text: `Welcome to Ponte City! To activate your profile, please select your role:` 
+        },
+        action: {
+          buttons: [
+            { type: 'reply', reply: { id: 'ROLE_RESIDENT', title: '🏠 Resident' } },
+            { type: 'reply', reply: { id: 'ROLE_RUNNER', title: '🏃 Runner' } },
+            { type: 'reply', reply: { id: 'ROLE_VISITOR', title: '🛡️ Visitor Pass' } }
+          ]
+        }
+      }
+    };
+
+    const response = await fetch(`https://graph.facebook.com/v18.0/${process.env.PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error('❌ Error sending registration menu:', error.message);
   }
 }
 
@@ -325,7 +425,7 @@ async function sendAccessTypeButtons(recipientPhone, visitorName) {
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending access buttons:', error.message);
+    console.error('❌ Error sending access type buttons:', error.message);
   }
 }
 
@@ -342,12 +442,15 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, captionText) {
         recipient_type: 'individual',
         to: recipientPhone,
         type: 'image',
-        image: { link: imageUrl, caption: captionText },
+        image: {
+          link: imageUrl,
+          caption: captionText,
+        },
       }),
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending image:', error.message);
+    console.error('❌ Error sending image message:', error.message);
   }
 }
 
@@ -362,7 +465,12 @@ async function sendRunnerJob(runnerPhone, job) {
         type: 'button',
         header: { type: 'text', text: '📦 PONTE CONCIERGE RUNNER' },
         body: {
-          text: `*New Task Available!*\n\n• *Job ID:* #${job.id}\n• *Pickup:* Reception Desk\n• *Destination:* Unit ${job.unit}\n• *Courier/Item:* ${job.courier}\n• *Payout:* R${job.payout.toFixed(2)}`,
+          text: `*New Task Available!*\n\n` +
+                `• *Job ID:* #${job.id}\n` +
+                `• *Pickup:* Reception Desk\n` +
+                `• *Destination:* Unit ${job.unit}\n` +
+                `• *Courier/Item:* ${job.courier}\n` +
+                `• *Payout:* R${job.payout.toFixed(2)}`,
         },
         footer: { text: 'Tap to claim — first to accept gets the run.' },
         action: {
@@ -384,9 +492,13 @@ async function sendRunnerJob(runnerPhone, job) {
     });
     return await response.json();
   } catch (error) {
-    console.error('❌ Error sending runner job:', error.message);
+    console.error('❌ Error sending runner dispatch card:', error.message);
   }
 }
+
+// =================================================================
+// 5. TURNSTILE PASS DISPATCHER (LIVE TUNNEL OR MOCK FALLBACK)
+// =================================================================
 
 async function issueVisitorPass(recipientPhone, session) {
   const tunnelBaseUrl = process.env.HIKCENTRAL_BASE_URL;
@@ -421,7 +533,7 @@ async function issueVisitorPass(recipientPhone, session) {
         passCode = hcpData.data.visitorId || passCode;
       }
     } catch (err) {
-      console.warn('⚠️ Tunnel call failed; using mock pass fallback.', err.message);
+      console.warn('⚠️ Tunnel call timed out/failed; using mock pass fallback.', err.message);
     }
   }
 
@@ -441,6 +553,7 @@ async function issueVisitorPass(recipientPhone, session) {
   );
 }
 
+// Start Server
 app.listen(PORT, HOST, () => {
   console.log(`🚀 Ponte Concierge webhook server is running on http://${HOST}:${PORT}`);
 });
