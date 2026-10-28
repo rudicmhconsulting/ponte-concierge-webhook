@@ -204,8 +204,24 @@ app.post('/webhook', async (req, res) => {
             if (message.type === 'text') {
               const rawText = message.text.body.trim();
               const lowerText = rawText.toLowerCase();
-              console.log(`💬 Inbound text from ${senderPhone}: "${rawText}"`);
+              const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
+              console.log(`💬 Inbound text from ${senderPhone}: "${rawText}" (Clean: "${cleanText}")`);
 
+              // 1. BULLETPROOF ONE-TAP ONBOARDING TRIGGER (Meta QR + Direct QR + Common Greetings)
+              if (
+                cleanText === 'register' ||
+                cleanText === 'start' ||
+                cleanText === 'hi' ||
+                cleanText === 'hello' ||
+                cleanText.includes('interested in learning') ||
+                cleanText.includes('more about your business') ||
+                cleanText.includes('learning more')
+              ) {
+                await sendRegistrationMenu(senderPhone);
+                return;
+              }
+
+              // 2. VISITOR IDENTITY CAPTURE FLOW
               const vReg = visitorRegistrations.get(senderPhone);
               if (vReg && vReg.step === 'AWAITING_ID_NUMBER') {
                 const idCandidate = rawText.replace(/\s+/g, '');
@@ -239,6 +255,7 @@ app.post('/webhook', async (req, res) => {
                 return;
               }
 
+              // 3. RESIDENT VISITOR INVITATION FLOW
               const rSession = residentSessions.get(senderPhone);
               if (rSession && rSession.step === 'AWAITING_NAME_AND_CELL') {
                 const parts = rawText.split(',');
@@ -270,17 +287,7 @@ app.post('/webhook', async (req, res) => {
                 return;
               }
 
-              if (
-                lowerText === 'register' ||
-                lowerText === 'start' ||
-                lowerText.includes('interested in learning more about your business') ||
-                lowerText === 'hi' ||
-                lowerText === 'hello'
-              ) {
-                await sendRegistrationMenu(senderPhone);
-                return;
-              }
-
+              // 4. RUNNER SIMULATION
               if (lowerText === 'run' || lowerText === 'testjob') {
                 const testId = Math.floor(1000 + Math.random() * 9000).toString();
                 const newJob = { id: testId, unit: '3204', courier: 'Takealot', payout: 25.00, status: 'OPEN' };
@@ -289,6 +296,7 @@ app.post('/webhook', async (req, res) => {
                 return;
               }
 
+              // 5. DIRECT VISITOR INVITATION TRIGGER
               if (lowerText.includes('pass') || lowerText.includes('visitor')) {
                 residentSessions.set(senderPhone, { step: 'AWAITING_NAME_AND_CELL' });
                 await sendWhatsAppMessage(
@@ -298,6 +306,7 @@ app.post('/webhook', async (req, res) => {
                 return;
               }
 
+              // 6. PARCEL DISPATCH REQUEST
               if (lowerText.includes('parcel') || lowerText.includes('fetch') || lowerText.includes('collect')) {
                 const testId = Math.floor(1000 + Math.random() * 9000).toString();
                 const newJob = { id: testId, unit: 'Resident Request', courier: 'Reception Desk', payout: 25.00, status: 'OPEN' };
@@ -306,6 +315,7 @@ app.post('/webhook', async (req, res) => {
                 return;
               }
 
+              // 7. FALLBACK INSTRUCTIONAL MENU
               await sendWhatsAppMessage(
                 senderPhone,
                 `👋 *Welcome to Ponte Concierge!*\n\n• Text *register* to launch role onboarding\n• Text *run* to test the Runner Dispatch Job Box\n• Text *visitor* to invite a guest & issue a 24h pass\n• Text *parcel* to request an apartment runner`
