@@ -13,7 +13,7 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const HIKCENTRAL_BASE_URL = process.env.HIKCENTRAL_BASE_URL;
 
 // Operational Dispatch Numbers
-const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27734938495'; // Test desk number
+const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27734938495'; // Desk test
 const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458'; // Escalation lead
 
 // ============================================================================
@@ -21,14 +21,14 @@ const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458'; //
 // ============================================================================
 const userProfiles = new Map();     // phone -> { role, registeredAt, unit }
 const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType, zone }
-const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, accessType, zone, idNumber, photoUrl }
+const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, accessType, zone, idNumber, isPassport }
 const runnerJobs = new Map();       // jobId -> { status, claimedBy, token, unit, courier, payout }
-const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, reason, timestamp, zone, status }
+const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId }
 
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102' });
 
 // ============================================================================
-// IMAGE NORMALIZATION & ROTATION HELPER (Sharp)
+// IMAGE NORMALIZATION (Sharp)
 // ============================================================================
 async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
   try {
@@ -50,12 +50,12 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
 }
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE
+// FUZZY OCR INSPECTION ENGINE (SA Citizens)
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
   try {
-    console.log(`🔍 [OCR] Inspecting ID: ${declaredId}, Resident Declared Name: "${declaredName}"...`);
+    console.log(`🔍 [OCR] Inspecting ID: ${declaredId}, Declared Name: "${declaredName}"...`);
     
     let processedBuffer = await preprocessDocumentImage(imageBuffer, 0);
 
@@ -74,9 +74,7 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
       text.includes('LISENSIE') ||
       text.includes('LICENCE') ||
       text.includes('SADC') ||
-      text.includes('PERMIT') ||
-      text.includes('P<ZAF') || 
-      text.includes('<<<<');
+      text.includes('PERMIT');
 
     if (!hasDocKeywordsCheck(rawText)) {
       console.log('🔄 [OCR] Text unclear at 0°, attempting 90° rotation pass...');
@@ -194,7 +192,7 @@ function validateSouthAfricanID(idNumber) {
 }
 
 function maskID(idNumber) {
-  if (!idNumber) return 'VERIFIED';
+  if (!idNumber) return 'DOC-RECORDED';
   if (idNumber.length === 13) {
     return `${idNumber.substring(0, 6)}*****${idNumber.substring(11)}`;
   }
@@ -318,7 +316,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
     qrDataUrl,
     `🎟️ *PONTE CITY 24-HOUR ACCESS PASS*\n\n` +
       `• *Guest:* ${visitorData.visitorName}\n` +
-      `• *ID/Doc:* ${maskID(visitorData.idNumber)}\n` +
+      `• *Doc / ID:* ${maskID(visitorData.idNumber)}\n` +
       `• *Transit:* ${visitorData.accessType}\n` +
       `• *Pass Code:* ${passToken}\n` +
       `• ${zoneText}\n` +
@@ -330,7 +328,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
     await sendWhatsAppMessage(
       visitorData.hostPhone,
       `✅ *Visitor Pass Activated*\n\n` +
-        `Guest *${visitorData.visitorName}* has verified their document. Pass *[${passToken}]* has been delivered to their WhatsApp.`
+        `Guest *${visitorData.visitorName}* has been verified. Pass *[${passToken}]* has been delivered to their WhatsApp.`
     );
   }
 }
@@ -338,7 +336,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
 // ============================================================================
 // SECURITY / RECEPTION DIVERT ENGINE
 // ============================================================================
-async function triggerSecurityDivert(visitorPhone, visitorData, failReason) {
+async function triggerSecurityDivert(visitorPhone, visitorData, failReason, mediaId = null) {
   const alertId = `ALT-${Math.floor(1000 + Math.random() * 9000)}`;
 
   securityAlerts.set(alertId, {
@@ -346,18 +344,20 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason) {
     visitorName: visitorData.visitorName,
     visitorPhone: visitorPhone,
     hostPhone: visitorData.hostPhone || 'N/A',
+    idNumber: visitorData.idNumber,
     reason: failReason,
     timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
     zone: visitorData.zone || 'FULL_RESIDENTIAL',
     status: 'PENDING_MANUAL_REVIEW',
+    mediaId: mediaId
   });
 
   await sendWhatsAppMessage(
     visitorPhone,
-    `⚠️ *Verification & Clearance Notice*\n\n` +
-      `Hello ${visitorData.visitorName}, our access policy requires in-person document clearance for your arrival.\n\n` +
-      `*Notice:* ${failReason}\n\n` +
-      `🏢 *Next Step:* Please proceed directly to the *Ponte Reception / Security Desk* upon arrival. An officer will inspect your physical document and clear your access.\n\n` +
+    `⚠️ *Verification Clearance Notice*\n\n` +
+      `Hello ${visitorData.visitorName}, document clearance is required for entry.\n\n` +
+      `*Status:* ${failReason}\n\n` +
+      `🏢 *Next Step:* Please show your physical document to the officer at the *Ponte Reception / Security Desk* upon arrival to receive turnstile clearance.\n\n` +
       `• *Reference Voucher:* *[${alertId}]*`
   );
 
@@ -365,9 +365,9 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason) {
     `🚨 *PONTE VERIFICATION ALERT [#${alertId}]*\n\n` +
     `• *Guest:* ${visitorData.visitorName} (${visitorPhone})\n` +
     `• *Host Resident:* ${visitorData.hostPhone || 'Walk-in'}\n` +
-    `• *Doc / ID:* ${visitorData.idNumber || 'Pending'}\n` +
+    `• *Doc Number:* ${visitorData.idNumber}\n` +
     `• *Reason:* ${failReason}\n` +
-    `• *Action:* Inspect physical ID at desk or override via tablet terminal.\n\n` +
+    `• *Action:* Verify physical doc against tablet scan & clear.\n\n` +
     `_Notepad HUD: https://ponte-concierge-webhook.onrender.com/security/live_`;
 
   if (isReceptionOpen()) {
@@ -466,7 +466,7 @@ app.post('/webhook', async (req, res) => {
           formattedGuestPhone,
           `🏢 *Ponte City Visitor Pre-Clearance*\n\n` +
             `Hello ${session.visitorName}! Resident *${senderPhone}* has pre-cleared your arrival (${accessType}).\n\n` +
-            `To issue your 24-hour optical access pass, please reply with your *13-Digit South African ID Number* (or Passport Number):`
+            `To issue your 24-hour optical access pass, please reply with your *13-Digit South African ID Number* or *Passport Number*:`
         );
         return;
       }
@@ -497,7 +497,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // 2. IMAGE UPLOAD HANDLER
+    // 2. IMAGE UPLOAD HANDLER (Identical for ID & Passport)
     if (messageType === 'image') {
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
@@ -506,9 +506,23 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          '🔎 *Analyzing Document Image*\n\nAuto-orienting scan and running security verification. Please wait a moment...'
+          '🔎 *Analyzing Document Image*\n\nValidating document capture and routing to security registry. Please wait a moment...'
         );
 
+        // Branch A: International Passport -> Store image for Guard HUD, route to desk
+        if (visitorSession.isPassport) {
+          visitorSession.step = 'COMPLETED';
+          console.log(`🛂 [PASSPORT UPLOAD] Storing image ${imageId} for desk inspection.`);
+          await triggerSecurityDivert(
+            senderPhone,
+            visitorSession,
+            'International Passport Document (Requires In-Person Physical Check at Desk)',
+            imageId
+          );
+          return;
+        }
+
+        // Branch B: South African ID / Driver's License -> Automated OCR Verification
         const imageBuffer = await downloadMetaImage(imageId);
 
         if (!imageBuffer) {
@@ -530,7 +544,7 @@ app.post('/webhook', async (req, res) => {
 
         if (!ocrResult.verified) {
           console.warn(`❌ [OCR VERIFICATION FAILED] Reason: ${ocrResult.reason}`);
-          await triggerSecurityDivert(senderPhone, visitorSession, ocrResult.reason);
+          await triggerSecurityDivert(senderPhone, visitorSession, ocrResult.reason, imageId);
           return;
         }
 
@@ -551,7 +565,7 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
+          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by comma:\n*Example:* Sipho Dlamini, 0821234567`
         );
         return;
       }
@@ -646,42 +660,40 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Visitor Session: Validate ID or Passport
+      // Visitor Session: Validate ID or Passport format (Identical User Experience)
       const visSession = visitorSessions.get(senderPhone);
       if (visSession && visSession.step === 'AWAITING_ID_NUMBER') {
         const sanitizedId = cleanText.replace(/[\s\-\.]/g, '');
 
-        // 1. Detect Passport (6-10 alphanumeric characters containing letters)
-        const isPassport = /^[A-Z0-9]{6,10}$/i.test(sanitizedId) && /[A-Z]/i.test(sanitizedId);
-
-        // 2. Detect SA ID (13 continuous numeric digits)
-        const isSAID = /^\d{13}$/.test(sanitizedId);
+        // Detect Passport (alphanumeric 6-12 chars containing letters) vs SA ID (13 digits)
+        const isPassport = /^[A-Z0-9]{6,12}$/i.test(sanitizedId) && /[A-Z]/i.test(sanitizedId);
+        const isNumeric13 = /^\d{13}$/.test(sanitizedId);
 
         if (isPassport) {
           visSession.idNumber = sanitizedId;
-          visSession.step = 'COMPLETED';
+          visSession.isPassport = true;
+          visSession.step = 'AWAITING_DOC_IMAGE';
 
-          console.log(`🛂 [PASSPORT INGRESS] Routing passport ${sanitizedId} to reception desk.`);
-          
-          await triggerSecurityDivert(
+          await sendWhatsAppMessage(
             senderPhone,
-            visSession,
-            'Foreign Passport / International Travel Document (Requires In-Person Inspection)'
+            `✅ *Passport Recorded (${maskID(sanitizedId)})*\n\n` +
+              `Please upload a clear photo of your *Passport Identity Page* to complete your arrival record.`
           );
           return;
         }
 
-        if (isSAID) {
+        if (isNumeric13) {
           if (!validateSouthAfricanID(sanitizedId) && !sanitizedId.startsWith('999')) {
             await sendWhatsAppMessage(
               senderPhone,
               `❌ *Invalid South African ID Number*\n\n` +
-                `The 13-digit ID entered failed mathematical Luhn checksum validation. Please check your ID and re-enter:`
+                `The 13-digit ID failed mathematical Luhn checksum validation. Please check your number and re-enter:`
             );
             return;
           }
 
           visSession.idNumber = sanitizedId;
+          visSession.isPassport = false;
           visSession.step = 'AWAITING_DOC_IMAGE';
 
           await sendWhatsAppMessage(
@@ -726,7 +738,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// GUARD NOTEPAD HUD & OVERRIDE API
+// GUARD NOTEPAD HUD & OVERRIDE API (With Document Image Inspection)
 // ============================================================================
 app.get('/security/live', (req, res) => {
   const alertsList = Array.from(securityAlerts.values()).reverse();
@@ -734,12 +746,19 @@ app.get('/security/live', (req, res) => {
     <tr style="border-bottom: 1px solid #334155; ${a.status === 'APPROVED' ? 'opacity: 0.5;' : ''}">
       <td style="padding: 12px; font-weight: bold; color: #38bdf8;">${a.alertId}</td>
       <td style="padding: 12px;">${a.timestamp}</td>
-      <td style="padding: 12px;">${a.visitorName}<br><span style="font-size: 12px; color: #94a3b8;">${a.visitorPhone}</span></td>
-      <td style="padding: 12px; color: #f87171;">${a.reason}</td>
+      <td style="padding: 12px;">
+        <strong>${a.visitorName}</strong><br>
+        <span style="font-size: 12px; color: #94a3b8;">${a.visitorPhone}</span><br>
+        <span style="font-size: 11px; color: #cbd5e1;">Doc: ${a.idNumber}</span>
+      </td>
+      <td style="padding: 12px; color: #f87171;">
+        ${a.reason}<br>
+        ${a.mediaId ? `<span style="font-size: 11px; color: #38bdf8;">📷 Document scan attached to file</span>` : ''}
+      </td>
       <td style="padding: 12px;"><span style="background: ${a.zone === 'RETAIL_PARKING' ? '#eab308' : '#22c55e'}; color: #000; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">${a.zone}</span></td>
       <td style="padding: 12px;">
         ${a.status === 'PENDING_MANUAL_REVIEW'
-          ? `<a href="/security/override?id=${a.alertId}&action=APPROVE" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold;">Approve Pass</a>
+          ? `<a href="/security/override?id=${a.alertId}&action=APPROVE" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold;">Verify & Pass</a>
              <a href="/security/override?id=${a.alertId}&action=REJECT" style="background: #ef4444; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; margin-left: 6px;">Reject</a>`
           : `<span style="color: #4ade80; font-weight: bold;">${a.status}</span>`
         }
@@ -803,12 +822,12 @@ app.get('/security/override', async (req, res) => {
     alert.status = 'APPROVED';
     await generateTurnstilePass(alert.visitorPhone, {
       visitorName: alert.visitorName,
-      idNumber: alert.idNumber || 'DESK_VERIFIED',
+      idNumber: alert.idNumber || 'PHYSICAL_CHECK_PASSED',
       accessType: 'SECURITY_DESK_CLEARANCE',
       zone: alert.zone,
       hostPhone: alert.hostPhone
     });
-    await sendWhatsAppMessage(alert.visitorPhone, `🛡️ *Security Manual Clearance Granted*\nYour turnstile pass is displayed above.`);
+    await sendWhatsAppMessage(alert.visitorPhone, `🛡️ *Document Verified & Clearance Granted*\nYour turnstile pass is displayed above.`);
   } else {
     alert.status = 'REJECTED';
     await sendWhatsAppMessage(alert.visitorPhone, `🚫 *Entry Denied by Security Command*`);
@@ -832,7 +851,7 @@ app.post('/security/assisted-clear', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'Ponte Concierge Hybrid Engine', status: 'ONLINE', time: new Date().toISOString() });
+  res.json({ service: 'Ponte Concierge Unified Flow', status: 'ONLINE', time: new Date().toISOString() });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
