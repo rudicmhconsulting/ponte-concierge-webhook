@@ -27,70 +27,96 @@ const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visito
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102' });
 
 // ============================================================================
-// OCR INSPECTION ENGINE (Tesseract.js)
+// FUZZY OCR INSPECTION ENGINE (Preserves Resident Accountability)
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
   try {
-    console.log(`🔍 [OCR] Initializing Tesseract worker for ID: ${declaredId}...`);
+    console.log(`🔍 [OCR] Running Fuzzy Inspection for ID: ${declaredId}, Resident Declared Name: "${declaredName}"...`);
     worker = await createWorker('eng');
     
     const ret = await worker.recognize(imageBuffer);
-    const extractedText = ret.data.text.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-    const rawLines = ret.data.text.toUpperCase();
+    const rawText = ret.data.text.toUpperCase();
+    const alphanumericOnly = rawText.replace(/[^A-Z0-9]/g, '');
 
-    console.log(`📄 [OCR RAW EXTRACT]:\n--- START ---\n${ret.data.text.trim()}\n--- END ---`);
+    console.log(`📄 [OCR RAW EXTRACT]:\n--- START ---\n${rawText.trim()}\n--- END ---`);
 
-    // Clean declared search needles
-    const cleanId = declaredId.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-    const nameParts = declaredName.toUpperCase().split(/\s+/).filter(part => part.length > 2);
+    // 1. Clean ID & Extract Key Numerical Anchors
+    const cleanId = declaredId.replace(/[^0-9]/g, '');
+    const birthDigits = cleanId.substring(0, 6); // e.g. 730717
+    const lastDigits = cleanId.substring(6);
 
-    // 1. Primary Check: Does the extracted alphanumeric block contain the ID / Passport number?
-    const hasIdMatch = extractedText.includes(cleanId);
+    const fullIdMatch = alphanumericOnly.includes(cleanId);
+    const partialIdMatch = alphanumericOnly.includes(birthDigits) && 
+      (alphanumericOnly.includes(lastDigits) || alphanumericOnly.includes(cleanId.substring(6, 11)));
 
-    // 2. Secondary Check: Does it contain any part of the visitor's name/surname?
-    const hasNameMatch = nameParts.some(part => extractedText.includes(part));
+    // 2. Fuzzy Token Decomposition on Declared Name
+    // Ignores short prepositions/prefixes to isolate the unique family and given names
+    const stopWords = new Set(['VAN', 'DER', 'DE', 'DEN', 'DU', 'LA', 'LE', 'AND', 'MR', 'MRS', 'MS']);
+    const declaredTokens = declaredName
+      .toUpperCase()
+      .replace(/[^A-Z\s]/g, '')
+      .split(/\s+/)
+      .filter(t => t.length >= 3 && !stopWords.has(t));
 
-    // 3. Document Markers: Check for legitimate doc headers
+    // Check if key tokens or common OCR character variants match
+    const tokenMatchResults = declaredTokens.map(token => {
+      if (rawText.includes(token)) return true;
+
+      // Handle common OCR misreadings (e.g., RENSBURG vs RENSBURC)
+      const tokenStem = token.substring(0, Math.max(3, token.length - 1));
+      if (rawText.includes(tokenStem)) return true;
+
+      return false;
+    });
+
+    const hasSignificantNameMatch = tokenMatchResults.some(result => result === true);
+
+    // 3. Document Authenticity Markers (Smart ID, Green Book, License, Passport, MRZ)
     const hasDocKeywords = 
-      rawLines.includes('SOUTH AFRICA') || 
-      rawLines.includes('REPUBLIC') || 
-      rawLines.includes('IDENTITY') || 
-      rawLines.includes('PASSPORT') || 
-      rawLines.includes('DRIVER') || 
-      rawLines.includes('LICENSE') ||
-      rawLines.includes('PERMIT') ||
-      rawLines.includes('ASYLUM');
+      rawText.includes('SOUTH AFRICA') || 
+      rawText.includes('SUID-AFRIKA') ||
+      rawText.includes('REPUBLIC') || 
+      rawText.includes('IDENTITY') || 
+      rawText.includes('PASSPORT') || 
+      rawText.includes('DRIVING') || 
+      rawText.includes('BESTUURS') ||
+      rawText.includes('LISENSIE') ||
+      rawText.includes('LICENCE') ||
+      rawText.includes('SADC') ||
+      rawText.includes('PERMIT') ||
+      rawText.includes('P<ZAF') || 
+      rawText.includes('<<<<');
 
     await worker.terminate();
 
-    console.log(`📊 [OCR ASSESSMENT] ID Match: ${hasIdMatch} | Name Match: ${hasNameMatch} | Doc Keywords: ${hasDocKeywords}`);
+    console.log(`📊 [OCR ASSESSMENT] Full ID: ${fullIdMatch} | Partial ID: ${partialIdMatch} | Name Match: ${hasSignificantNameMatch} | Doc Keywords: ${hasDocKeywords}`);
 
-    if (hasIdMatch || (hasNameMatch && hasDocKeywords)) {
+    // Evaluation rules:
+    // If genuine document markers exist AND (either the numeric ID aligns OR the family name aligns) -> PASS
+    if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && hasDocKeywords) {
       return { verified: true, reason: 'MATCH_CONFIRMED' };
-    } else if (!hasDocKeywords && !hasIdMatch && !hasNameMatch) {
+    } else if (!hasDocKeywords && !fullIdMatch && !hasSignificantNameMatch) {
       return { verified: false, reason: 'Invalid or non-document image uploaded (e.g. random photo/object)' };
     } else {
-      return { verified: false, reason: `Document ID/Name mismatch. Extracted characters do not match entered ID (${declaredId})` };
+      return { verified: false, reason: `Document mismatch. Extracted text did not verify against resident invite for '${declaredName}'` };
     }
   } catch (err) {
     if (worker) await worker.terminate();
     console.error('❌ [OCR ENGINE ERROR]:', err.message);
-    return { verified: false, reason: 'OCR processing timeout or unreadable image' };
+    return { verified: false, reason: 'OCR processing error or unreadable image' };
   }
 }
 
 // Download binary image buffer from Meta Cloud API
 async function downloadMetaImage(imageId) {
   try {
-    // 1. Get media URL
     const mediaRes = await fetch(`https://graph.facebook.com/v18.0/${imageId}`, {
       headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
     });
     const mediaData = await mediaRes.json();
     if (!mediaData.url) throw new Error('No media URL returned by Meta');
 
-    // 2. Download binary buffer
     const imageRes = await fetch(mediaData.url, {
       headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
     });
@@ -301,7 +327,6 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason) {
     status: 'PENDING_MANUAL_REVIEW',
   });
 
-  // 1. Direct guest to physical reception desk
   await sendWhatsAppMessage(
     visitorPhone,
     `⚠️ *Verification Clearance Notice*\n\n` +
@@ -311,7 +336,6 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason) {
       `• *Reference ID:* *[${alertId}]*`
   );
 
-  // 2. Alert operations team based on shift hours
   const alertPayload =
     `🚨 *PONTE VERIFICATION ALERT [#${alertId}]*\n\n` +
     `• *Guest:* ${visitorData.visitorName} (${visitorPhone})\n` +
@@ -447,7 +471,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // 2. IMAGE UPLOAD HANDLER WITH REAL OCR
+    // 2. IMAGE UPLOAD HANDLER WITH FUZZY OCR
     if (messageType === 'image') {
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
@@ -456,10 +480,9 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          '🔎 *Analyzing Document Image*\n\nRunning OCR biometric and ID text extraction. Please wait a moment...'
+          '🔎 *Analyzing Document Image*\n\nRunning automated security & ID verification. Please wait a moment...'
         );
 
-        // Download raw buffer from Meta
         const imageBuffer = await downloadMetaImage(imageId);
 
         if (!imageBuffer) {
@@ -471,7 +494,7 @@ app.post('/webhook', async (req, res) => {
           return;
         }
 
-        // Run real Tesseract OCR extraction
+        // Execute Fuzzy OCR matching
         const ocrResult = await performDocumentOCR(
           imageBuffer,
           visitorSession.idNumber,
@@ -486,7 +509,6 @@ app.post('/webhook', async (req, res) => {
           return;
         }
 
-        // Passed verification: issue pass
         console.log(`✅ [OCR VERIFICATION PASSED] Issuing pass to ${senderPhone}`);
         await generateTurnstilePass(senderPhone, visitorSession);
         return;
@@ -505,7 +527,7 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by comma:\n*Example:* Sipho Dlamini, 0821234567`
+          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
         );
         return;
       }
@@ -559,7 +581,7 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `👥 *Ponte Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`
+          `👥 *Ponte Residential Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`
         );
         return;
       }
