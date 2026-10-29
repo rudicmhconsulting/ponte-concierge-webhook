@@ -1,5 +1,6 @@
 const express = require('express');
 const { createWorker } = require('tesseract.js');
+const sharp = require('sharp');
 
 const app = express();
 app.use(express.json());
@@ -27,18 +28,75 @@ const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visito
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102' });
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE (Preserves Resident Accountability)
+// IMAGE NORMALIZATION & ROTATION HELPER (Sharp)
+// ============================================================================
+async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
+  try {
+    let pipeline = sharp(rawBuffer).rotate(); // Auto-rotates based on mobile EXIF data
+
+    if (rotateAngle > 0) {
+      pipeline = pipeline.rotate(rotateAngle);
+    }
+
+    // Enhance contrast and convert to greyscale for high OCR accuracy
+    return await pipeline
+      .resize({ width: 1400, withoutEnlargement: true }) // Bound memory footprint
+      .greyscale()
+      .normalize()
+      .toBuffer();
+  } catch (err) {
+    console.warn('⚠️ Sharp pre-processing warning, falling back to raw buffer:', err.message);
+    return rawBuffer;
+  }
+}
+
+// ============================================================================
+// FUZZY OCR INSPECTION ENGINE
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
   try {
-    console.log(`🔍 [OCR] Running Fuzzy Inspection for ID: ${declaredId}, Resident Declared Name: "${declaredName}"...`);
-    worker = await createWorker('eng');
+    console.log(`🔍 [OCR] Inspecting ID: ${declaredId}, Resident Declared Name: "${declaredName}"...`);
     
-    const ret = await worker.recognize(imageBuffer);
-    const rawText = ret.data.text.toUpperCase();
-    const alphanumericOnly = rawText.replace(/[^A-Z0-9]/g, '');
+    // Pass 1: Auto-oriented & contrast-enhanced image
+    let processedBuffer = await preprocessDocumentImage(imageBuffer, 0);
 
+    worker = await createWorker('eng');
+    let ret = await worker.recognize(processedBuffer);
+    let rawText = ret.data.text.toUpperCase();
+
+    // Check if initial scan produced legible document text
+    const hasDocKeywordsCheck = (text) => 
+      text.includes('SOUTH AFRICA') || 
+      text.includes('SUID-AFRIKA') ||
+      text.includes('REPUBLIC') || 
+      text.includes('IDENTITY') || 
+      text.includes('PASSPORT') || 
+      text.includes('DRIVING') || 
+      text.includes('BESTUURS') ||
+      text.includes('LISENSIE') ||
+      text.includes('LICENCE') ||
+      text.includes('SADC') ||
+      text.includes('PERMIT') ||
+      text.includes('P<ZAF') || 
+      text.includes('<<<<');
+
+    // If card was shot sideways (0 keywords), try a single fast 90-degree clockwise pass
+    if (!hasDocKeywordsCheck(rawText)) {
+      console.log('🔄 [OCR] Text unclear at 0°, attempting 90° rotation pass...');
+      const rotatedBuffer = await preprocessDocumentImage(imageBuffer, 90);
+      const retRotated = await worker.recognize(rotatedBuffer);
+      const rotatedText = retRotated.data.text.toUpperCase();
+
+      if (hasDocKeywordsCheck(rotatedText)) {
+        rawText = rotatedText;
+        console.log('✅ [OCR] 90° rotation succeeded in detecting document markers.');
+      }
+    }
+
+    await worker.terminate();
+
+    const alphanumericOnly = rawText.replace(/[^A-Z0-9]/g, '');
     console.log(`📄 [OCR RAW EXTRACT]:\n--- START ---\n${rawText.trim()}\n--- END ---`);
 
     // 1. Clean ID & Extract Key Numerical Anchors
@@ -51,7 +109,6 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
       (alphanumericOnly.includes(lastDigits) || alphanumericOnly.includes(cleanId.substring(6, 11)));
 
     // 2. Fuzzy Token Decomposition on Declared Name
-    // Ignores short prepositions/prefixes to isolate the unique family and given names
     const stopWords = new Set(['VAN', 'DER', 'DE', 'DEN', 'DU', 'LA', 'LE', 'AND', 'MR', 'MRS', 'MS']);
     const declaredTokens = declaredName
       .toUpperCase()
@@ -59,41 +116,18 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
       .split(/\s+/)
       .filter(t => t.length >= 3 && !stopWords.has(t));
 
-    // Check if key tokens or common OCR character variants match
     const tokenMatchResults = declaredTokens.map(token => {
       if (rawText.includes(token)) return true;
-
-      // Handle common OCR misreadings (e.g., RENSBURG vs RENSBURC)
       const tokenStem = token.substring(0, Math.max(3, token.length - 1));
-      if (rawText.includes(tokenStem)) return true;
-
-      return false;
+      return rawText.includes(tokenStem);
     });
 
     const hasSignificantNameMatch = tokenMatchResults.some(result => result === true);
-
-    // 3. Document Authenticity Markers (Smart ID, Green Book, License, Passport, MRZ)
-    const hasDocKeywords = 
-      rawText.includes('SOUTH AFRICA') || 
-      rawText.includes('SUID-AFRIKA') ||
-      rawText.includes('REPUBLIC') || 
-      rawText.includes('IDENTITY') || 
-      rawText.includes('PASSPORT') || 
-      rawText.includes('DRIVING') || 
-      rawText.includes('BESTUURS') ||
-      rawText.includes('LISENSIE') ||
-      rawText.includes('LICENCE') ||
-      rawText.includes('SADC') ||
-      rawText.includes('PERMIT') ||
-      rawText.includes('P<ZAF') || 
-      rawText.includes('<<<<');
-
-    await worker.terminate();
+    const hasDocKeywords = hasDocKeywordsCheck(rawText);
 
     console.log(`📊 [OCR ASSESSMENT] Full ID: ${fullIdMatch} | Partial ID: ${partialIdMatch} | Name Match: ${hasSignificantNameMatch} | Doc Keywords: ${hasDocKeywords}`);
 
-    // Evaluation rules:
-    // If genuine document markers exist AND (either the numeric ID aligns OR the family name aligns) -> PASS
+    // If valid document markers exist AND (either the numeric ID aligns OR the family name aligns) -> PASS
     if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && hasDocKeywords) {
       return { verified: true, reason: 'MATCH_CONFIRMED' };
     } else if (!hasDocKeywords && !fullIdMatch && !hasSignificantNameMatch) {
@@ -471,7 +505,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // 2. IMAGE UPLOAD HANDLER WITH FUZZY OCR
+    // 2. IMAGE UPLOAD HANDLER WITH SHARP NORMALIZATION & FUZZY OCR
     if (messageType === 'image') {
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
@@ -480,7 +514,7 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          '🔎 *Analyzing Document Image*\n\nRunning automated security & ID verification. Please wait a moment...'
+          '🔎 *Analyzing Document Image*\n\nAuto-orienting scan and running security verification. Please wait a moment...'
         );
 
         const imageBuffer = await downloadMetaImage(imageId);
@@ -494,7 +528,7 @@ app.post('/webhook', async (req, res) => {
           return;
         }
 
-        // Execute Fuzzy OCR matching
+        // Execute Preprocessed & Fuzzy OCR matching
         const ocrResult = await performDocumentOCR(
           imageBuffer,
           visitorSession.idNumber,
@@ -527,7 +561,7 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
+          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by comma:\n*Example:* Sipho Dlamini, 0821234567`
         );
         return;
       }
