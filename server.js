@@ -1,5 +1,4 @@
-import express from 'express';
-import fetch from 'node-fetch';
+const express = require('express');
 
 const app = express();
 app.use(express.json());
@@ -8,10 +7,10 @@ const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ponte_secure_token_2026';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const HIKCENTRAL_BASE_URL = process.env.HIKCENTRAL_BASE_URL; // Leave blank to run decoupled mock-pass mode
+const HIKCENTRAL_BASE_URL = process.env.HIKCENTRAL_BASE_URL; // Leave blank for decoupled mock mode
 
 // ============================================================================
-// IN-MEMORY STATE STORES (Persistent across active runtime)
+// IN-MEMORY STATE STORES
 // ============================================================================
 const userProfiles = new Map();     // phone -> { role: 'RESIDENT' | 'RUNNER', registeredAt: Date, unit?: string }
 const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType }
@@ -27,7 +26,6 @@ userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), un
 function validateSouthAfricanID(idNumber) {
   if (!/^\d{13}$/.test(idNumber)) return false;
 
-  const year = parseInt(idNumber.substring(0, 2), 10);
   const month = parseInt(idNumber.substring(2, 4), 10);
   const day = parseInt(idNumber.substring(4, 6), 10);
 
@@ -53,7 +51,7 @@ function maskID(idNumber) {
 }
 
 // ============================================================================
-// OUTBOUND META GRAPH API HELPERS
+// OUTBOUND META GRAPH API HELPERS (Uses native global fetch)
 // ============================================================================
 async function sendWhatsAppMessage(recipientPhone, messageText) {
   try {
@@ -180,7 +178,7 @@ async function sendRunnerDashboard(recipientPhone) {
 }
 
 // ============================================================================
-// HIKCENTRAL PASS ISSUANCE / DECOUPLED FALLBACK
+// PASS GENERATION / DECOUPLED FALLBACK
 // ============================================================================
 async function generateTurnstilePass(visitorPhone, visitorData) {
   const passToken = `PC-PASS-${Math.floor(100000 + Math.random() * 900000)}`;
@@ -264,14 +262,11 @@ app.post('/webhook', async (req, res) => {
     const senderPhone = message.from;
     const messageType = message.type;
 
-    // ------------------------------------------------------------------------
     // 1. INTERACTIVE BUTTON CLICKS
-    // ------------------------------------------------------------------------
     if (messageType === 'interactive' && message.interactive.type === 'button_reply') {
       const buttonId = message.interactive.button_reply.id;
       console.log(`[BUTTON] From: ${senderPhone} | ID: ${buttonId}`);
 
-      // Role Selection Handlers
       if (buttonId === 'ROLE_RESIDENT') {
         userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102' });
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS' });
@@ -297,7 +292,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Visitor Transit Mode Selection Handlers
       if (buttonId.startsWith('ACCESS_TYPE_')) {
         const session = residentSessions.get(senderPhone);
         if (!session) {
@@ -336,7 +330,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Runner Dispatch Handlers (Concurrency Protected)
       if (buttonId.startsWith('JOB_ACCEPT_')) {
         const jobId = buttonId.replace('JOB_ACCEPT_', '');
         const job = runnerJobs.get(jobId);
@@ -374,9 +367,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // ------------------------------------------------------------------------
-    // 2. IMAGE UPLOAD HANDLER (Visitor Document Photo Intake)
-    // ------------------------------------------------------------------------
+    // 2. IMAGE UPLOAD HANDLER
     if (messageType === 'image') {
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
@@ -396,9 +387,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // ------------------------------------------------------------------------
     // 3. TEXT MESSAGE INGRESS & ROUTING
-    // ------------------------------------------------------------------------
     if (messageType === 'text') {
       const rawText = message.text.body.trim();
       const lowerText = rawText.toLowerCase();
@@ -406,7 +395,7 @@ app.post('/webhook', async (req, res) => {
 
       console.log(`[INBOUND TEXT] From: ${senderPhone} | Body: "${rawText}"`);
 
-      // A. Unified Ingress / Greeting Catchers
+      // Ingress / Greeting Catchers
       if (
         cleanText === 'register' ||
         cleanText === 'start' ||
@@ -429,12 +418,10 @@ app.post('/webhook', async (req, res) => {
           }
         }
 
-        // New / Unregistered profile -> Sanitized Onboarding
         await sendCleanRegistrationMenu(senderPhone);
         return;
       }
 
-      // B. Resident Visitor Command
       if (cleanText === 'visitor' || cleanText === 'invite') {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS' });
         await sendWhatsAppMessage(
@@ -446,7 +433,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // C. Runner Dispatch Simulator / Request Command
       if (cleanText === 'run' || cleanText === 'parcel' || cleanText === 'package') {
         const jobId = Math.floor(1000 + Math.random() * 9000).toString();
         runnerJobs.set(jobId, {
@@ -476,7 +462,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // D. Active Resident Conversation: Awaiting Guest Name & Cell
       const resSession = residentSessions.get(senderPhone);
       if (resSession && resSession.step === 'AWAITING_GUEST_DETAILS') {
         const parts = rawText.split(',');
@@ -508,7 +493,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // E. Active Visitor Conversation: Awaiting SA ID Number
       const visSession = visitorSessions.get(senderPhone);
       if (visSession && visSession.step === 'AWAITING_ID_NUMBER') {
         const sanitizedId = cleanText.replace(/\s+/g, '');
@@ -534,7 +518,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // F. Default Fallback
+      // Default fallback
       await sendWhatsAppMessage(
         senderPhone,
         `👋 *Ponte Concierge System*\n\n` +
