@@ -12,8 +12,8 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const HIKCENTRAL_BASE_URL = process.env.HIKCENTRAL_BASE_URL;
 
-// Paystack Configuration
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_mock_paystack_key';
+// Paystack Integration Keys
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_d6d2799487eed5ab4923196391ee28601e7f0dd6';
 
 // Operational Dispatch Numbers
 const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27734938495';
@@ -54,7 +54,7 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
 }
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE (Smart ID, License & SA Passport Auto-Pass)
+// FUZZY OCR INSPECTION ENGINE
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
@@ -173,20 +173,21 @@ async function downloadMetaImage(imageId) {
 }
 
 // ============================================================================
-// PAYSTACK PAYMENT LINK GENERATOR (R35.00 Launch Promo)
+// PAYSTACK INITIALIZE & CHECKOUT GENERATOR (R35.00 Launch Promo)
 // ============================================================================
-async function generatePaystackCheckout(residentPhone, unit, reference) {
+async function generatePaystackCheckout(residentPhone, unit, jobId) {
   try {
     const payload = {
       email: `resident.unit${unit}@pontecity.co.za`,
-      amount: 3500, // R35.00 Promo Price (in South African Cents)
+      amount: 3500, // R35.00 Promo (in Cents)
       currency: 'ZAR',
-      reference: `PC-${reference}-${Date.now().toString().slice(-4)}`,
+      reference: `PC-${jobId}-${Date.now().toString().slice(-4)}`,
+      callback_url: `https://wa.me/27734938495`,
       metadata: {
+        jobId: jobId,
         phone: residentPhone,
         unit: unit,
         pricing: 'PROMO_R35',
-        regularPrice: 'R50.00',
         service: 'PONTE_RUNNER_SERVICE'
       }
     };
@@ -212,7 +213,7 @@ async function generatePaystackCheckout(residentPhone, unit, reference) {
 }
 
 // ============================================================================
-// TIME-OF-DAY ROUTING (Mon-Fri 07:00 - 16:00 SAST)
+// TIME-OF-DAY ROUTING
 // ============================================================================
 function isReceptionOpen() {
   const now = new Date();
@@ -348,7 +349,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption) {
 }
 
 // ============================================================================
-// PASS GENERATION & CLEARANCE (With Ingress Escort & Exit Authorization Options)
+// PASS GENERATION & CLEARANCE
 // ============================================================================
 async function generateTurnstilePass(visitorPhone, visitorData) {
   const zoneTag = visitorData.zone === 'RETAIL_PARKING' ? 'ZONE_RETAIL_PARKING' : 'ZONE_FULL_RESIDENTIAL';
@@ -482,6 +483,40 @@ async function broadcastRunnerJob(job) {
 }
 
 // ============================================================================
+// PAYSTACK WEBHOOK LISTENER (Payment-Gated Runner Dispatch)
+// ============================================================================
+app.post('/paystack/webhook', async (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    const event = req.body;
+    if (event.event === 'charge.success') {
+      const paymentRef = event.data.reference;
+      const jobId = event.data.metadata?.jobId;
+      console.log(`💳 [PAYSTACK SUCCESS] Confirmed payment for Job #${jobId} (Ref: ${paymentRef})`);
+
+      const job = runnerJobs.get(jobId);
+      if (job && job.status === 'PENDING_PAYMENT') {
+        job.status = 'PAID_AWAITING_CLAIM';
+        job.paidAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+
+        // Alert resident
+        await sendWhatsAppMessage(
+          job.hostPhone,
+          `✅ *Payment Confirmed (R35.00)*\n\n` +
+            `Task *#${job.jobId}* has been funded and broadcast to the Ponte Runner roster. You will be notified once a runner claims it.`
+        );
+
+        // Broadcast to runners
+        await broadcastRunnerJob(job);
+      }
+    }
+  } catch (err) {
+    console.error('❌ Paystack webhook error:', err.message);
+  }
+});
+
+// ============================================================================
 // WEBHOOK VERIFICATION (GET)
 // ============================================================================
 app.get('/webhook', (req, res) => {
@@ -516,7 +551,6 @@ app.post('/webhook', async (req, res) => {
     if (messageType === 'interactive' && message.interactive.type === 'button_reply') {
       const buttonId = message.interactive.button_reply.id;
 
-      // Onboarding Profiles
       if (buttonId === 'ROLE_RESIDENT') {
         userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
@@ -539,7 +573,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Ingress Meet Options
       if (buttonId.startsWith('LOBBY_MEET_')) {
         const guestPhone = buttonId.replace('LOBBY_MEET_', '');
         await sendInteractiveButtons(
@@ -571,7 +604,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Standalone Runner Booking Prompts
       if (buttonId === 'REQ_RUNNER_PARCEL' || buttonId === 'REQ_RUNNER_ESCORT') {
         const taskType = buttonId === 'REQ_RUNNER_PARCEL' ? 'PARCEL_COLLECTION' : 'VISITOR_ESCORT';
         residentSessions.set(senderPhone, {
@@ -587,7 +619,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Access Type Selection
       if (buttonId.startsWith('ACCESS_TYPE_')) {
         const session = residentSessions.get(senderPhone);
         if (!session) return;
@@ -623,7 +654,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Runner Acceptance & Handshake Triggers
       if (buttonId.startsWith('JOB_ACCEPT_')) {
         const jobId = buttonId.replace('JOB_ACCEPT_', '');
         const job = runnerJobs.get(jobId);
@@ -658,7 +688,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Step 1: Runner marks delivery -> prompts resident for handshake
+      // Handover: Runner reports delivery
       if (buttonId.startsWith('JOB_DELIVERED_')) {
         const jobId = buttonId.replace('JOB_DELIVERED_', '');
         const job = runnerJobs.get(jobId);
@@ -686,7 +716,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Step 2: Resident confirms receipt -> UNLOCKS RUNNER PAYOUT
+      // Handover: Resident verifies receipt -> unlocks runner payout
       if (buttonId.startsWith('RESIDENT_CONFIRM_')) {
         const jobId = buttonId.replace('RESIDENT_CONFIRM_', '');
         const job = runnerJobs.get(jobId);
@@ -703,7 +733,6 @@ app.post('/webhook', async (req, res) => {
           );
         }
 
-        // Offer exit authorization button to the host if it was a visitor escort
         if (job.taskType === 'VISITOR_ESCORT' && job.guestPhone) {
           await sendInteractiveButtons(
             senderPhone,
@@ -725,7 +754,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Host Resident authorizes exit (Symmetric Custody Policy)
+      // Exit Authorization
       if (buttonId.startsWith('AUTH_EXIT_')) {
         const guestPhone = buttonId.replace('AUTH_EXIT_', '');
         const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'Resident' };
@@ -807,7 +836,6 @@ app.post('/webhook', async (req, res) => {
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
-      // Enforce Policy: Visitors cannot self-authorize exit
       if (cleanText === 'exit' || cleanText === 'checkout' || cleanText === 'leave') {
         const isVisitor = visitorSessions.has(senderPhone);
         if (isVisitor) {
@@ -821,7 +849,7 @@ app.post('/webhook', async (req, res) => {
         }
       }
 
-      // Check for Resident Runner Note Submission
+      // Gated Dispatch on Payment: Resident Submits Note -> Returns Paystack Link
       const activeResSession = residentSessions.get(senderPhone);
       if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_NOTE') {
         const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'RC Janse van Rensburg' };
@@ -829,7 +857,7 @@ app.post('/webhook', async (req, res) => {
 
         const jobRecord = {
           jobId,
-          status: 'PENDING',
+          status: 'PENDING_PAYMENT',
           unit: hostProfile.unit,
           hostName: hostProfile.fullName,
           hostPhone: senderPhone,
@@ -847,15 +875,14 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          `🚀 *Ponte Runner Dispatched [#${jobId}]*\n\n` +
-            `• *Pickup Instructions:* _"${rawText}"_\n` +
-            `• *Standard Rate:* ~R50.00~\n` +
-            `• *Launch Promo:* *R35.00*\n\n` +
-            `💳 *Pay Now via Paystack:*\n${checkoutUrl}\n\n` +
-            `_Active Ponte Runners have received your request. You will be notified once claimed._`
+          `💳 *Confirm Ponte Runner Booking [#${jobId}]*\n\n` +
+            `• *Service:* ${jobRecord.taskType === 'PARCEL_COLLECTION' ? 'Parcel Collection' : 'Visitor Escort'}\n` +
+            `• *Pickup Note:* _"${rawText}"_\n` +
+            `• *Standard Fee:* ~R50.00~\n` +
+            `• *Promo Fee:* *R35.00*\n\n` +
+            `👉 *Tap Link to Complete Payment:*\n${checkoutUrl}\n\n` +
+            `_Once payment is approved, your task will automatically broadcast to active Ponte Runners._`
         );
-
-        await broadcastRunnerJob(jobRecord);
         return;
       }
 
