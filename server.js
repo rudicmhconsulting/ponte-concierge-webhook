@@ -23,9 +23,9 @@ const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458';
 // IN-MEMORY STATE STORES & AUDIT REGISTRY
 // ============================================================================
 const userProfiles = new Map();     // phone -> { role, registeredAt, unit, fullName }
-const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType, zone, taskType }
+const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType, zone, taskType, guestPhone }
 const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, accessType, zone, idNumber, isPassport }
-const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid }
+const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid, deliveredAt, completedAt }
 const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId }
 
 // Seed default verified test resident
@@ -54,7 +54,7 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
 }
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE
+// FUZZY OCR INSPECTION ENGINE (Smart ID, License & SA Passport Auto-Pass)
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
@@ -348,7 +348,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption) {
 }
 
 // ============================================================================
-// PASS GENERATION & CLEARANCE (With Ingress Escort Prompt)
+// PASS GENERATION & CLEARANCE (With Ingress Escort & Exit Authorization Options)
 // ============================================================================
 async function generateTurnstilePass(visitorPhone, visitorData) {
   const zoneTag = visitorData.zone === 'RETAIL_PARKING' ? 'ZONE_RETAIL_PARKING' : 'ZONE_FULL_RESIDENTIAL';
@@ -516,13 +516,14 @@ app.post('/webhook', async (req, res) => {
     if (messageType === 'interactive' && message.interactive.type === 'button_reply') {
       const buttonId = message.interactive.button_reply.id;
 
+      // Onboarding Profiles
       if (buttonId === 'ROLE_RESIDENT') {
         userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
           `🏠 *Ponte Resident Profile Registered*\n\n` +
-            `To pre-clear a visitor right now, reply with their *Full Name* and *Cell Number* separated by a comma:\n\n` +
+            `To pre-clear a visitor, reply with their *Full Name* and *Cell Number* separated by a comma:\n\n` +
             `*Example:* Sipho Dlamini, 0821234567`
         );
         return;
@@ -538,11 +539,17 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      // Ingress Meet Options
       if (buttonId.startsWith('LOBBY_MEET_')) {
-        await sendWhatsAppMessage(
+        const guestPhone = buttonId.replace('LOBBY_MEET_', '');
+        await sendInteractiveButtons(
           senderPhone,
-          `👍 *Personal Reception Confirmed*\n\n` +
-            `Please meet your visitor at the lobby turnstiles.`
+          'PERSONAL RECEPTION CONFIRMED',
+          `Please meet your visitor at the lobby turnstiles.\n\n` +
+            `When your guest is ready to leave later, authorize departure below:`,
+          [
+            { id: `AUTH_EXIT_${guestPhone}`, title: 'Authorize Exit 🚪' }
+          ]
         );
         return;
       }
@@ -564,6 +571,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      // Standalone Runner Booking Prompts
       if (buttonId === 'REQ_RUNNER_PARCEL' || buttonId === 'REQ_RUNNER_ESCORT') {
         const taskType = buttonId === 'REQ_RUNNER_PARCEL' ? 'PARCEL_COLLECTION' : 'VISITOR_ESCORT';
         residentSessions.set(senderPhone, {
@@ -579,6 +587,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      // Access Type Selection
       if (buttonId.startsWith('ACCESS_TYPE_')) {
         const session = residentSessions.get(senderPhone);
         if (!session) return;
@@ -614,6 +623,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      // Runner Acceptance & Handshake Triggers
       if (buttonId.startsWith('JOB_ACCEPT_')) {
         const jobId = buttonId.replace('JOB_ACCEPT_', '');
         const job = runnerJobs.get(jobId);
@@ -626,21 +636,124 @@ app.post('/webhook', async (req, res) => {
         job.status = 'CLAIMED';
         job.claimedBy = senderPhone;
         const pickupToken = `PK-${Math.floor(1000 + Math.random() * 9000)}`;
+        job.token = pickupToken;
 
-        await sendWhatsAppMessage(
+        await sendInteractiveButtons(
           senderPhone,
-          `🚀 *Task #${jobId} Confirmed & Locked!*\n\n` +
-            `• *Type:* ${job.taskType}\n` +
-            `• *Destination:* Unit ${job.unit} (${job.hostName}: ${job.hostPhone})\n` +
-            `📌 *Instructions:* _${job.details}_\n\n` +
-            `🔑 *Custody Handover Token:* *[${pickupToken}]*\n` +
-            `_Present this token to the gatehouse guard or visitor upon collection._`
+          `TASK #${jobId} LOCKED`,
+          `• *Type:* ${job.taskType}\n` +
+          `• *Destination:* Unit ${job.unit} (${job.hostName}: ${job.hostPhone})\n` +
+          `📌 *Instructions:* _${job.details}_\n` +
+          `🔑 *Custody Handover Token:* *[${pickupToken}]*\n\n` +
+          `Tap below once you have completed delivery at Unit ${job.unit}:`,
+          [
+            { id: `JOB_DELIVERED_${jobId}`, title: 'Delivered to Unit ✅' }
+          ]
         );
         return;
       }
 
       if (buttonId.startsWith('JOB_DECLINE_')) {
         await sendWhatsAppMessage(senderPhone, `👍 Task declined. You remain on the active standby roster.`);
+        return;
+      }
+
+      // Step 1: Runner marks delivery -> prompts resident for handshake
+      if (buttonId.startsWith('JOB_DELIVERED_')) {
+        const jobId = buttonId.replace('JOB_DELIVERED_', '');
+        const job = runnerJobs.get(jobId);
+        if (!job) return;
+
+        job.status = 'AWAITING_RESIDENT_CONFIRMATION';
+        job.deliveredAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+
+        await sendWhatsAppMessage(
+          senderPhone,
+          `⏳ *Delivery Reported for Task #${jobId}*\n\n` +
+            `Waiting for resident (${job.hostName}, Unit ${job.unit}) to confirm physical handover before releasing payout balance.`
+        );
+
+        await sendInteractiveButtons(
+          job.hostPhone,
+          'CONFIRM HANDOVER / DELIVERY',
+          `🚪 Ponte Runner (${senderPhone}) reports completing task *#${jobId}* at your unit door.\n\n` +
+            `Please confirm you have received your ${job.taskType === 'PARCEL_COLLECTION' ? 'parcel' : 'guest'}:`,
+          [
+            { id: `RESIDENT_CONFIRM_${jobId}`, title: 'Confirm Receipt 👍' },
+            { id: `RESIDENT_DISPUTE_${jobId}`, title: 'Not Received ⚠️' }
+          ]
+        );
+        return;
+      }
+
+      // Step 2: Resident confirms receipt -> UNLOCKS RUNNER PAYOUT
+      if (buttonId.startsWith('RESIDENT_CONFIRM_')) {
+        const jobId = buttonId.replace('RESIDENT_CONFIRM_', '');
+        const job = runnerJobs.get(jobId);
+        if (!job) return;
+
+        job.status = 'COMPLETED_VERIFIED';
+        job.completedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+
+        if (job.claimedBy) {
+          await sendWhatsAppMessage(
+            job.claimedBy,
+            `🎉 *Task #${jobId} Verified by Resident!*\n\n` +
+              `Unit ${job.unit} confirmed safe handover. *R25.00* has been credited to your active shift balance.`
+          );
+        }
+
+        // Offer exit authorization button to the host if it was a visitor escort
+        if (job.taskType === 'VISITOR_ESCORT' && job.guestPhone) {
+          await sendInteractiveButtons(
+            senderPhone,
+            'HANDOVER COMPLETED',
+            `✅ Task #${jobId} closed.\n\nWhen your guest is ready to leave later, authorize departure below:`,
+            [
+              { id: `AUTH_EXIT_${job.guestPhone}`, title: 'Authorize Exit 🚪' }
+            ]
+          );
+        } else {
+          await sendWhatsAppMessage(senderPhone, `✅ *Task #${jobId} Closed & Verified.*`);
+        }
+        return;
+      }
+
+      if (buttonId.startsWith('RESIDENT_DISPUTE_')) {
+        const jobId = buttonId.replace('RESIDENT_DISPUTE_', '');
+        await sendWhatsAppMessage(senderPhone, `⚠️ Handover dispute logged. Building security duty manager alerted.`);
+        return;
+      }
+
+      // Host Resident authorizes exit (Symmetric Custody Policy)
+      if (buttonId.startsWith('AUTH_EXIT_')) {
+        const guestPhone = buttonId.replace('AUTH_EXIT_', '');
+        const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'Resident' };
+
+        const exitAlertId = `EXIT-${Math.floor(1000 + Math.random() * 9000)}`;
+        securityAlerts.set(exitAlertId, {
+          alertId: exitAlertId,
+          visitorName: `Guest (${guestPhone})`,
+          visitorPhone: guestPhone,
+          hostPhone: senderPhone,
+          idNumber: 'EGRESS_AUTHORIZED',
+          reason: `Exit Authorized by Host (Unit ${hostProfile.unit}). Escort to turnstiles required.`,
+          timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+          zone: 'EGRESS_CLEARANCE',
+          status: 'PENDING_MANUAL_REVIEW'
+        });
+
+        await sendWhatsAppMessage(
+          senderPhone,
+          `🚪 *Exit Clearance Authorized*\n\n` +
+            `Security at the turnstiles has been alerted on their tablet HUD. Please accompany your guest (or dispatch an escort runner) to the turnstiles to complete physical sign-out.`
+        );
+
+        await sendWhatsAppMessage(
+          guestPhone,
+          `👋 *Departure Authorized*\n\n` +
+            `Your host has authorized your exit. Please proceed with your escort to the ground turnstiles for gatehouse sign-out.`
+        );
         return;
       }
     }
@@ -694,6 +807,20 @@ app.post('/webhook', async (req, res) => {
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
+      // Enforce Policy: Visitors cannot self-authorize exit
+      if (cleanText === 'exit' || cleanText === 'checkout' || cleanText === 'leave') {
+        const isVisitor = visitorSessions.has(senderPhone);
+        if (isVisitor) {
+          await sendWhatsAppMessage(
+            senderPhone,
+            `🚫 *Departure Policy Notice*\n\n` +
+              `Under Ponte City security regulations, visitors cannot self-authorize exit.\n\n` +
+              `Your host resident must authorize your exit pass and accompany you (or assign an escort runner) to the turnstiles.`
+          );
+          return;
+        }
+      }
+
       // Check for Resident Runner Note Submission
       const activeResSession = residentSessions.get(senderPhone);
       if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_NOTE') {
@@ -706,6 +833,7 @@ app.post('/webhook', async (req, res) => {
           unit: hostProfile.unit,
           hostName: hostProfile.fullName,
           hostPhone: senderPhone,
+          guestPhone: activeResSession.guestPhone || null,
           details: rawText,
           taskType: activeResSession.taskType || 'RUNNER_SERVICE',
           payout: 'R25.00',
@@ -715,7 +843,6 @@ app.post('/webhook', async (req, res) => {
         runnerJobs.set(jobId, jobRecord);
         residentSessions.delete(senderPhone);
 
-        // Generate Paystack checkout link for R35.00 Promo
         const checkoutUrl = await generatePaystackCheckout(senderPhone, hostProfile.unit, jobId);
 
         await sendWhatsAppMessage(
@@ -762,7 +889,7 @@ app.post('/webhook', async (req, res) => {
           if (existing.role === 'RESIDENT') {
             await sendWhatsAppMessage(
               senderPhone,
-              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite a guest\n• Reply *runner* to request parcel/escort\n• Reply *retail* for parking pass`
+              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite a guest\n• Reply *runner* to book parcel/escort\n• Reply *retail* for parking pass`
             );
             return;
           }
@@ -907,12 +1034,12 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// GUARD NOTEPAD HUD & OVERRIDE API
+// GUARD NOTEPAD HUD & OVERRIDE API (With Egress Sign-Out Support)
 // ============================================================================
 app.get('/security/live', (req, res) => {
   const alertsList = Array.from(securityAlerts.values()).reverse();
   const rows = alertsList.map(a => `
-    <tr style="border-bottom: 1px solid #334155; ${a.status === 'APPROVED' ? 'opacity: 0.5;' : ''}">
+    <tr style="border-bottom: 1px solid #334155; ${a.status === 'APPROVED' || a.status === 'EXIT_CONFIRMED' ? 'opacity: 0.5;' : ''}">
       <td style="padding: 12px; font-weight: bold; color: #38bdf8;">${a.alertId}</td>
       <td style="padding: 12px;">${a.timestamp}</td>
       <td style="padding: 12px;">
@@ -920,16 +1047,19 @@ app.get('/security/live', (req, res) => {
         <span style="font-size: 12px; color: #94a3b8;">${a.visitorPhone}</span><br>
         <span style="font-size: 11px; color: #cbd5e1;">Doc: ${a.idNumber}</span>
       </td>
-      <td style="padding: 12px; color: #f87171;">
+      <td style="padding: 12px; color: ${a.zone === 'EGRESS_CLEARANCE' ? '#eab308' : '#f87171'};">
         ${a.reason}<br>
         ${a.mediaId ? `<span style="font-size: 11px; color: #38bdf8;">📷 Document scan attached to file</span>` : ''}
       </td>
-      <td style="padding: 12px;"><span style="background: ${a.zone === 'RETAIL_PARKING' ? '#eab308' : '#22c55e'}; color: #000; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">${a.zone}</span></td>
+      <td style="padding: 12px;"><span style="background: ${a.zone === 'RETAIL_PARKING' ? '#eab308' : (a.zone === 'EGRESS_CLEARANCE' ? '#f97316' : '#22c55e')}; color: #000; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">${a.zone}</span></td>
       <td style="padding: 12px;">
-        ${a.status === 'PENDING_MANUAL_REVIEW'
-          ? `<a href="/security/override?id=${a.alertId}&action=APPROVE" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold;">Verify & Pass</a>
-             <a href="/security/override?id=${a.alertId}&action=REJECT" style="background: #ef4444; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; margin-left: 6px;">Reject</a>`
-          : `<span style="color: #4ade80; font-weight: bold;">${a.status}</span>`
+        ${a.status === 'PENDING_MANUAL_REVIEW' && a.zone === 'EGRESS_CLEARANCE'
+          ? `<a href="/security/override?id=${a.alertId}&action=CONFIRM_EXIT" style="background: #f97316; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold;">Sign Out Exit 🚪</a>`
+          : (a.status === 'PENDING_MANUAL_REVIEW'
+              ? `<a href="/security/override?id=${a.alertId}&action=APPROVE" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold;">Verify & Pass</a>
+                 <a href="/security/override?id=${a.alertId}&action=REJECT" style="background: #ef4444; color: white; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; margin-left: 6px;">Reject</a>`
+              : `<span style="color: #4ade80; font-weight: bold;">${a.status}</span>`
+            )
         }
       </td>
     </tr>
@@ -958,7 +1088,7 @@ app.get('/security/live', (req, res) => {
         </div>
         <table>
           <thead>
-            <tr><th>Alert Ref</th><th>Time</th><th>Visitor Details</th><th>Divert Reason</th><th>Zone</th><th>Action</th></tr>
+            <tr><th>Alert Ref</th><th>Time</th><th>Visitor Details</th><th>Divert / Egress Reason</th><th>Zone</th><th>Action</th></tr>
           </thead>
           <tbody>
             ${rows || '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #64748b;">No active verification alerts.</td></tr>'}
@@ -997,6 +1127,18 @@ app.get('/security/override', async (req, res) => {
       hostPhone: alert.hostPhone
     });
     await sendWhatsAppMessage(alert.visitorPhone, `🛡️ *Document Verified & Clearance Granted*\nYour turnstile pass is displayed above.`);
+  } else if (action === 'CONFIRM_EXIT') {
+    alert.status = 'EXIT_CONFIRMED';
+    await sendWhatsAppMessage(
+      alert.visitorPhone,
+      `🚪 *Exit Logged*\n\nTurnstile exit confirmed by security guard at ${new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' })}. Safe travels!`
+    );
+    if (alert.hostPhone && alert.hostPhone !== 'Walk-in') {
+      await sendWhatsAppMessage(
+        alert.hostPhone,
+        `👋 *Guest Departure Completed*\n\n${alert.visitorName} has signed out through the ground turnstiles.`
+      );
+    }
   } else {
     alert.status = 'REJECTED';
     await sendWhatsAppMessage(alert.visitorPhone, `🚫 *Entry Denied by Security Command*`);
@@ -1020,7 +1162,7 @@ app.post('/security/assisted-clear', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'Ponte Concierge Promo Engine', status: 'ONLINE', time: new Date().toISOString() });
+  res.json({ service: 'Ponte Concierge Complete Custody Engine', status: 'ONLINE', time: new Date().toISOString() });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
