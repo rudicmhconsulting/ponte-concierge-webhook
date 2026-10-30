@@ -12,20 +12,24 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const HIKCENTRAL_BASE_URL = process.env.HIKCENTRAL_BASE_URL;
 
+// Paystack Configuration
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_mock_paystack_key';
+
 // Operational Dispatch Numbers
-const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27734938495'; // Desk test
-const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458'; // Escalation lead
+const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27734938495';
+const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458';
 
 // ============================================================================
 // IN-MEMORY STATE STORES & AUDIT REGISTRY
 // ============================================================================
-const userProfiles = new Map();     // phone -> { role, registeredAt, unit }
-const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType, zone }
+const userProfiles = new Map();     // phone -> { role, registeredAt, unit, fullName }
+const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType, zone, taskType }
 const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, accessType, zone, idNumber, isPassport }
-const runnerJobs = new Map();       // jobId -> { status, claimedBy, token, unit, courier, payout }
+const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid }
 const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId }
 
-userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102' });
+// Seed default verified test resident
+userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
 
 // ============================================================================
 // IMAGE NORMALIZATION (Sharp)
@@ -50,7 +54,7 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
 }
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE (Smart ID, License & SA Passport Auto-Pass)
+// FUZZY OCR INSPECTION ENGINE
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
@@ -86,7 +90,7 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
 
       if (hasDocKeywordsCheck(rotatedText)) {
         rawText = rotatedText;
-        console.log('✅ [OCR] 90° rotation succeeded in detecting document markers.');
+        console.log('✅ [OCR] 90° rotation detected document markers.');
       }
     }
 
@@ -95,7 +99,6 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
     const alphanumericOnly = rawText.replace(/[^A-Z0-9]/g, '');
     console.log(`📄 [OCR RAW EXTRACT]:\n--- START ---\n${rawText.trim()}\n--- END ---`);
 
-    // 1. Numerical & Doc Anchors
     const cleanId = declaredId.replace(/[^A-Z0-9]/gi, '').toUpperCase();
     const isNumericSAID = /^\d{13}$/.test(cleanId);
     
@@ -109,7 +112,6 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
         (alphanumericOnly.includes(lastDigits) || alphanumericOnly.includes(cleanId.substring(6, 11)));
     }
 
-    // 2. Fuzzy Token Decomposition on Declared Name
     const stopWords = new Set(['VAN', 'DER', 'DE', 'DEN', 'DU', 'LA', 'LE', 'AND', 'MR', 'MRS', 'MS']);
     const declaredTokens = declaredName
       .toUpperCase()
@@ -126,29 +128,23 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
     const hasSignificantNameMatch = tokenMatchResults.some(result => result === true);
     const hasDocKeywords = hasDocKeywordsCheck(rawText);
 
-    // 3. Document Classification
     const isSAPassport = (rawText.includes('P<ZAF') || (rawText.includes('SOUTH AFRICA') && rawText.includes('PASSPORT')));
     const isSADocument = hasDocKeywords && (rawText.includes('SOUTH AFRICA') || rawText.includes('SUID-AFRIKA') || rawText.includes('SADC') || isSAPassport);
 
     console.log(`📊 [OCR ASSESSMENT] DocMatch: ${fullIdMatch || partialIdMatch} | NameMatch: ${hasSignificantNameMatch} | SAPassport: ${isSAPassport} | SADoc: ${isSADocument}`);
 
-    // Evaluation Rule:
-    // A. South African Document (Smart ID, License, or SA Passport) verified -> AUTO PASS
     if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && isSADocument) {
       return { verified: true, reason: 'MATCH_CONFIRMED' };
     } 
     
-    // B. Legitimate International Passport -> Direct to Reception Desk with Document Scan
     if (rawText.includes('PASSPORT') || rawText.includes('<<<<') || rawText.includes('P<')) {
       return { verified: false, reason: 'International Passport Document (Requires In-Person Physical Check at Desk)' };
     }
 
-    // C. Non-document image or blur
     if (!hasDocKeywords && !fullIdMatch && !hasSignificantNameMatch) {
       return { verified: false, reason: 'Invalid or non-document image uploaded (e.g. random photo/object)' };
     }
 
-    // D. Information mismatch
     return { verified: false, reason: `Document mismatch. Extracted text did not verify against resident invite for '${declaredName}'` };
   } catch (err) {
     if (worker) await worker.terminate();
@@ -173,6 +169,45 @@ async function downloadMetaImage(imageId) {
   } catch (err) {
     console.error('❌ [IMAGE DOWNLOAD ERROR]:', err.message);
     return null;
+  }
+}
+
+// ============================================================================
+// PAYSTACK PAYMENT LINK GENERATOR (R35.00 Launch Promo)
+// ============================================================================
+async function generatePaystackCheckout(residentPhone, unit, reference) {
+  try {
+    const payload = {
+      email: `resident.unit${unit}@pontecity.co.za`,
+      amount: 3500, // R35.00 Promo Price (in South African Cents)
+      currency: 'ZAR',
+      reference: `PC-${reference}-${Date.now().toString().slice(-4)}`,
+      metadata: {
+        phone: residentPhone,
+        unit: unit,
+        pricing: 'PROMO_R35',
+        regularPrice: 'R50.00',
+        service: 'PONTE_RUNNER_SERVICE'
+      }
+    };
+
+    const res = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await res.json();
+    if (data.status && data.data?.authorization_url) {
+      return data.data.authorization_url;
+    }
+    return `https://paystack.com/pay/ponte-runner-promo-unit-${unit}`;
+  } catch (err) {
+    console.error('❌ [PAYSTACK ERROR]:', err.message);
+    return `https://paystack.com/pay/ponte-runner-promo-unit-${unit}`;
   }
 }
 
@@ -313,7 +348,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption) {
 }
 
 // ============================================================================
-// PASS GENERATION & CLEARANCE
+// PASS GENERATION & CLEARANCE (With Ingress Escort Prompt)
 // ============================================================================
 async function generateTurnstilePass(visitorPhone, visitorData) {
   const zoneTag = visitorData.zone === 'RETAIL_PARKING' ? 'ZONE_RETAIL_PARKING' : 'ZONE_FULL_RESIDENTIAL';
@@ -349,10 +384,27 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
   );
 
   if (visitorData.hostPhone) {
-    await sendWhatsAppMessage(
+    const hostProfile = userProfiles.get(visitorData.hostPhone) || { unit: '5102', fullName: 'Ponte Resident' };
+
+    residentSessions.set(`ACTIVE_PASS_${visitorPhone}`, {
+      guestName: visitorData.visitorName,
+      guestPhone: visitorPhone,
+      hostName: hostProfile.fullName,
+      hostPhone: visitorData.hostPhone,
+      hostUnit: hostProfile.unit,
+      passToken: passToken
+    });
+
+    await sendInteractiveButtons(
       visitorData.hostPhone,
-      `✅ *Visitor Pass Activated*\n\n` +
-        `Guest *${visitorData.visitorName}* has been verified. Pass *[${passToken}]* has been delivered to their WhatsApp.`
+      'VISITOR ARRIVAL PROTOCOL',
+      `✅ *Pass Activated for ${visitorData.visitorName}* [${passToken}].\n\n` +
+        `How would you like to receive your guest at the turnstiles?`,
+      [
+        { id: `LOBBY_MEET_${visitorPhone}`, title: "I'll Meet in Lobby" },
+        { id: `DISPATCH_ESCORT_${visitorPhone}`, title: "Request Runner" }
+      ],
+      'Promo: R35.00 per runner escort (Standard R50.00)'
     );
   }
 }
@@ -404,6 +456,32 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason, medi
 }
 
 // ============================================================================
+// DISPATCH BROADCAST ENGINE
+// ============================================================================
+async function broadcastRunnerJob(job) {
+  const runnerAlertText =
+    `🏃 *NEW PONTE RUNNER TASK [#${job.jobId}]*\n\n` +
+    `• *Type:* ${job.taskType}\n` +
+    `• *Host:* ${job.hostName} (Unit ${job.unit}) - ${job.hostPhone}\n` +
+    `📌 *Pickup Instructions:*\n_${job.details}_\n\n` +
+    `• *Payout:* ${job.payout}`;
+
+  for (const [phone, profile] of userProfiles.entries()) {
+    if (profile.role === 'RUNNER') {
+      await sendInteractiveButtons(
+        phone,
+        'PONTE TASK DISPATCH',
+        runnerAlertText,
+        [
+          { id: `JOB_ACCEPT_${job.jobId}`, title: 'Accept Task 🚀' },
+          { id: `JOB_DECLINE_${job.jobId}`, title: 'Decline' }
+        ]
+      );
+    }
+  }
+}
+
+// ============================================================================
 // WEBHOOK VERIFICATION (GET)
 // ============================================================================
 app.get('/webhook', (req, res) => {
@@ -439,11 +517,11 @@ app.post('/webhook', async (req, res) => {
       const buttonId = message.interactive.button_reply.id;
 
       if (buttonId === 'ROLE_RESIDENT') {
-        userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102' });
+        userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Resident Profile Registered*\n\n` +
+          `🏠 *Ponte Resident Profile Registered*\n\n` +
             `To pre-clear a visitor right now, reply with their *Full Name* and *Cell Number* separated by a comma:\n\n` +
             `*Example:* Sipho Dlamini, 0821234567`
         );
@@ -454,9 +532,50 @@ app.post('/webhook', async (req, res) => {
         userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date() });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏃 *Resident Runner Roster Activated*\n\n` +
-            `You are registered on the standby delivery roster.`
+          `🏃 *Ponte Runner Roster Activated*\n\n` +
+            `You are registered on the active standby delivery & escort roster.`
         );
+        return;
+      }
+
+      if (buttonId.startsWith('LOBBY_MEET_')) {
+        await sendWhatsAppMessage(
+          senderPhone,
+          `👍 *Personal Reception Confirmed*\n\n` +
+            `Please meet your visitor at the lobby turnstiles.`
+        );
+        return;
+      }
+
+      if (buttonId.startsWith('DISPATCH_ESCORT_')) {
+        const guestPhone = buttonId.replace('DISPATCH_ESCORT_', '');
+        residentSessions.set(senderPhone, {
+          step: 'AWAITING_RUNNER_NOTE',
+          taskType: 'VISITOR_ESCORT',
+          guestPhone: guestPhone
+        });
+
+        await sendWhatsAppMessage(
+          senderPhone,
+          `📝 *Pickup Location Note*\n\n` +
+            `Please reply with a quick note of where your guest is waiting:\n` +
+            `*(e.g., "Lobby turnstiles, arrived via Uber" or "Main Gate Pedestrians")*`
+        );
+        return;
+      }
+
+      if (buttonId === 'REQ_RUNNER_PARCEL' || buttonId === 'REQ_RUNNER_ESCORT') {
+        const taskType = buttonId === 'REQ_RUNNER_PARCEL' ? 'PARCEL_COLLECTION' : 'VISITOR_ESCORT';
+        residentSessions.set(senderPhone, {
+          step: 'AWAITING_RUNNER_NOTE',
+          taskType: taskType
+        });
+
+        const promptText = taskType === 'PARCEL_COLLECTION'
+          ? `📝 *Order / Delivery Details:*\n\nReply with what to collect and where:\n*(e.g., "Main Gate - Pick n Pay order under Rudi" or "Guard Hut - Takealot parcel")*`
+          : `📝 *Escort Details:*\n\nReply with who and where to meet:\n*(e.g., "Lobby turnstiles - Thabo 0821234567")*`;
+
+        await sendWhatsAppMessage(senderPhone, promptText);
         return;
       }
 
@@ -490,7 +609,7 @@ app.post('/webhook', async (req, res) => {
           formattedGuestPhone,
           `🏢 *Ponte City Visitor Pre-Clearance*\n\n` +
             `Hello ${session.visitorName}! Resident *${senderPhone}* has pre-cleared your arrival (${accessType}).\n\n` +
-            `To issue your 24-hour optical access pass, please reply with your *13-Digit South African ID Number* or *Passport Number*:`
+            `To issue your 24-hour optical access pass, reply with your *13-Digit South African ID Number* or *Passport Number*:`
         );
         return;
       }
@@ -500,7 +619,7 @@ app.post('/webhook', async (req, res) => {
         const job = runnerJobs.get(jobId);
 
         if (!job || job.status === 'CLAIMED') {
-          await sendWhatsAppMessage(senderPhone, `❌ *Snooze you lose!* Job #${jobId} was claimed by another runner.`);
+          await sendWhatsAppMessage(senderPhone, `❌ *Task already claimed* by another Ponte Runner.`);
           return;
         }
 
@@ -510,18 +629,23 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          `🚀 *Job #${jobId} Confirmed & Locked!*\n\n🔑 *Pickup Custody Token:* *[${pickupToken}]*`
+          `🚀 *Task #${jobId} Confirmed & Locked!*\n\n` +
+            `• *Type:* ${job.taskType}\n` +
+            `• *Destination:* Unit ${job.unit} (${job.hostName}: ${job.hostPhone})\n` +
+            `📌 *Instructions:* _${job.details}_\n\n` +
+            `🔑 *Custody Handover Token:* *[${pickupToken}]*\n` +
+            `_Present this token to the gatehouse guard or visitor upon collection._`
         );
         return;
       }
 
       if (buttonId.startsWith('JOB_DECLINE_')) {
-        await sendWhatsAppMessage(senderPhone, `👍 Job declined. You remain on the standby roster.`);
+        await sendWhatsAppMessage(senderPhone, `👍 Task declined. You remain on the active standby roster.`);
         return;
       }
     }
 
-    // 2. IMAGE UPLOAD HANDLER (Uniform OCR across ID, License & Passports)
+    // 2. IMAGE UPLOAD HANDLER
     if (messageType === 'image') {
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
@@ -552,14 +676,12 @@ app.post('/webhook', async (req, res) => {
 
         visitorSession.step = 'COMPLETED';
 
-        // Auto-Clear Path: Valid Smart ID, Driver's License, or SA Passport
         if (ocrResult.verified) {
-          console.log(`✅ [OCR VERIFICATION PASSED] Issuing turnstile pass to ${senderPhone}`);
+          console.log(`✅ [OCR VERIFICATION PASSED] Auto-issuing pass to ${senderPhone}`);
           await generateTurnstilePass(senderPhone, visitorSession);
           return;
         }
 
-        // Divert Path: Foreign Passports, unverified formats, or blurry captures
         console.warn(`⚠️ [INSPECTION DIVERT] Reason: ${ocrResult.reason}`);
         await triggerSecurityDivert(senderPhone, visitorSession, ocrResult.reason, imageId);
         return;
@@ -572,19 +694,57 @@ app.post('/webhook', async (req, res) => {
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
+      // Check for Resident Runner Note Submission
+      const activeResSession = residentSessions.get(senderPhone);
+      if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_NOTE') {
+        const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'RC Janse van Rensburg' };
+        const jobId = Math.floor(1000 + Math.random() * 9000).toString();
+
+        const jobRecord = {
+          jobId,
+          status: 'PENDING',
+          unit: hostProfile.unit,
+          hostName: hostProfile.fullName,
+          hostPhone: senderPhone,
+          details: rawText,
+          taskType: activeResSession.taskType || 'RUNNER_SERVICE',
+          payout: 'R25.00',
+          feePaid: 'R35.00'
+        };
+
+        runnerJobs.set(jobId, jobRecord);
+        residentSessions.delete(senderPhone);
+
+        // Generate Paystack checkout link for R35.00 Promo
+        const checkoutUrl = await generatePaystackCheckout(senderPhone, hostProfile.unit, jobId);
+
+        await sendWhatsAppMessage(
+          senderPhone,
+          `🚀 *Ponte Runner Dispatched [#${jobId}]*\n\n` +
+            `• *Pickup Instructions:* _"${rawText}"_\n` +
+            `• *Standard Rate:* ~R50.00~\n` +
+            `• *Launch Promo:* *R35.00*\n\n` +
+            `💳 *Pay Now via Paystack:*\n${checkoutUrl}\n\n` +
+            `_Active Ponte Runners have received your request. You will be notified once claimed._`
+        );
+
+        await broadcastRunnerJob(jobRecord);
+        return;
+      }
+
       if (cleanText === '1') {
-        userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102' });
+        userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
+          `🏠 *Ponte Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
         );
         return;
       }
 
       if (cleanText === '2') {
         userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date() });
-        await sendWhatsAppMessage(senderPhone, `🏃 *Resident Runner Roster Activated*`);
+        await sendWhatsAppMessage(senderPhone, `🏃 *Ponte Runner Roster Activated*`);
         return;
       }
 
@@ -602,12 +762,12 @@ app.post('/webhook', async (req, res) => {
           if (existing.role === 'RESIDENT') {
             await sendWhatsAppMessage(
               senderPhone,
-              `👋 *Welcome back Resident!*\n\n• Reply *visitor* to invite a guest\n• Reply *retail* for parking-only pass\n• Reply *parcel* to request runner`
+              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite a guest\n• Reply *runner* to request parcel/escort\n• Reply *retail* for parking pass`
             );
             return;
           }
           if (existing.role === 'RUNNER') {
-            await sendWhatsAppMessage(senderPhone, `🏃 *Welcome back Runner!*\n\nReply *run* for test dispatch.`);
+            await sendWhatsAppMessage(senderPhone, `🏃 *Welcome back Ponte Runner!*\n\nYou are on the active standby roster.`);
             return;
           }
         }
@@ -617,10 +777,24 @@ app.post('/webhook', async (req, res) => {
           'PONTE CONCIERGE',
           'Welcome to Ponte City! Please select your profile:',
           [
-            { id: 'ROLE_RESIDENT', title: 'Resident' },
-            { id: 'ROLE_RUNNER', title: 'Resident Runner' }
+            { id: 'ROLE_RESIDENT', title: 'Ponte Resident' },
+            { id: 'ROLE_RUNNER', title: 'Ponte Runner' }
           ],
           'Visitors: Passes are issued by your host.'
+        );
+        return;
+      }
+
+      if (cleanText === 'runner' || cleanText === 'parcel' || cleanText === 'delivery') {
+        await sendInteractiveButtons(
+          senderPhone,
+          'REQUEST A RUNNER',
+          'Select the runner service you require:',
+          [
+            { id: 'REQ_RUNNER_PARCEL', title: 'Collect Delivery 🛒' },
+            { id: 'REQ_RUNNER_ESCORT', title: 'Escort a Visitor 👥' }
+          ],
+          'Promo Rate: R35.00 per service (Regular R50)'
         );
         return;
       }
@@ -725,23 +899,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Runner test
-      if (cleanText === 'run' || cleanText === 'parcel') {
-        const jobId = Math.floor(1000 + Math.random() * 9000).toString();
-        runnerJobs.set(jobId, { status: 'PENDING', unit: '3204', payout: 'R25.00' });
-        await sendInteractiveButtons(
-          senderPhone,
-          'PONTE DISPATCH',
-          `New Runner Task: Unit 3204 (Payout: R25.00)`,
-          [
-            { id: `JOB_ACCEPT_${jobId}`, title: 'Accept Run 🚀' },
-            { id: `JOB_DECLINE_${jobId}`, title: 'Decline' },
-          ]
-        );
-        return;
-      }
-
-      await sendWhatsAppMessage(senderPhone, `👋 *Ponte Concierge System*\n\n• Reply *visitor* to invite a guest\n• Reply *parcel* for runner delivery`);
+      await sendWhatsAppMessage(senderPhone, `👋 *Ponte Concierge System*\n\n• Reply *visitor* to invite a guest\n• Reply *runner* to book parcel/escort\n• Reply *retail* for parking pass`);
     }
   } catch (error) {
     console.error('❌ Webhook error:', error);
@@ -862,7 +1020,7 @@ app.post('/security/assisted-clear', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'Ponte Concierge Unified Engine', status: 'ONLINE', time: new Date().toISOString() });
+  res.json({ service: 'Ponte Concierge Promo Engine', status: 'ONLINE', time: new Date().toISOString() });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
