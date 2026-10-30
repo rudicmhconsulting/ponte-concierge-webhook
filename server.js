@@ -50,12 +50,12 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
 }
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE (SA Citizens)
+// FUZZY OCR INSPECTION ENGINE (Smart ID, License & SA Passport Auto-Pass)
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
   try {
-    console.log(`🔍 [OCR] Inspecting ID: ${declaredId}, Declared Name: "${declaredName}"...`);
+    console.log(`🔍 [OCR] Inspecting ID/Doc: ${declaredId}, Declared Name: "${declaredName}"...`);
     
     let processedBuffer = await preprocessDocumentImage(imageBuffer, 0);
 
@@ -74,7 +74,9 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
       text.includes('LISENSIE') ||
       text.includes('LICENCE') ||
       text.includes('SADC') ||
-      text.includes('PERMIT');
+      text.includes('PERMIT') ||
+      text.includes('P<ZAF') || 
+      text.includes('<<<<');
 
     if (!hasDocKeywordsCheck(rawText)) {
       console.log('🔄 [OCR] Text unclear at 0°, attempting 90° rotation pass...');
@@ -93,14 +95,21 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
     const alphanumericOnly = rawText.replace(/[^A-Z0-9]/g, '');
     console.log(`📄 [OCR RAW EXTRACT]:\n--- START ---\n${rawText.trim()}\n--- END ---`);
 
-    const cleanId = declaredId.replace(/[^0-9]/g, '');
-    const birthDigits = cleanId.substring(0, 6);
-    const lastDigits = cleanId.substring(6);
+    // 1. Numerical & Doc Anchors
+    const cleanId = declaredId.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    const isNumericSAID = /^\d{13}$/.test(cleanId);
+    
+    let fullIdMatch = alphanumericOnly.includes(cleanId);
+    let partialIdMatch = false;
 
-    const fullIdMatch = alphanumericOnly.includes(cleanId);
-    const partialIdMatch = alphanumericOnly.includes(birthDigits) && 
-      (alphanumericOnly.includes(lastDigits) || alphanumericOnly.includes(cleanId.substring(6, 11)));
+    if (isNumericSAID) {
+      const birthDigits = cleanId.substring(0, 6);
+      const lastDigits = cleanId.substring(6);
+      partialIdMatch = alphanumericOnly.includes(birthDigits) && 
+        (alphanumericOnly.includes(lastDigits) || alphanumericOnly.includes(cleanId.substring(6, 11)));
+    }
 
+    // 2. Fuzzy Token Decomposition on Declared Name
     const stopWords = new Set(['VAN', 'DER', 'DE', 'DEN', 'DU', 'LA', 'LE', 'AND', 'MR', 'MRS', 'MS']);
     const declaredTokens = declaredName
       .toUpperCase()
@@ -117,15 +126,30 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
     const hasSignificantNameMatch = tokenMatchResults.some(result => result === true);
     const hasDocKeywords = hasDocKeywordsCheck(rawText);
 
-    console.log(`📊 [OCR ASSESSMENT] Full ID: ${fullIdMatch} | Partial ID: ${partialIdMatch} | Name Match: ${hasSignificantNameMatch} | Doc Keywords: ${hasDocKeywords}`);
+    // 3. Document Classification
+    const isSAPassport = (rawText.includes('P<ZAF') || (rawText.includes('SOUTH AFRICA') && rawText.includes('PASSPORT')));
+    const isSADocument = hasDocKeywords && (rawText.includes('SOUTH AFRICA') || rawText.includes('SUID-AFRIKA') || rawText.includes('SADC') || isSAPassport);
 
-    if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && hasDocKeywords) {
+    console.log(`📊 [OCR ASSESSMENT] DocMatch: ${fullIdMatch || partialIdMatch} | NameMatch: ${hasSignificantNameMatch} | SAPassport: ${isSAPassport} | SADoc: ${isSADocument}`);
+
+    // Evaluation Rule:
+    // A. South African Document (Smart ID, License, or SA Passport) verified -> AUTO PASS
+    if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && isSADocument) {
       return { verified: true, reason: 'MATCH_CONFIRMED' };
-    } else if (!hasDocKeywords && !fullIdMatch && !hasSignificantNameMatch) {
-      return { verified: false, reason: 'Invalid or non-document image uploaded (e.g. random photo/object)' };
-    } else {
-      return { verified: false, reason: `Document mismatch. Extracted text did not verify against resident invite for '${declaredName}'` };
+    } 
+    
+    // B. Legitimate International Passport -> Direct to Reception Desk with Document Scan
+    if (rawText.includes('PASSPORT') || rawText.includes('<<<<') || rawText.includes('P<')) {
+      return { verified: false, reason: 'International Passport Document (Requires In-Person Physical Check at Desk)' };
     }
+
+    // C. Non-document image or blur
+    if (!hasDocKeywords && !fullIdMatch && !hasSignificantNameMatch) {
+      return { verified: false, reason: 'Invalid or non-document image uploaded (e.g. random photo/object)' };
+    }
+
+    // D. Information mismatch
+    return { verified: false, reason: `Document mismatch. Extracted text did not verify against resident invite for '${declaredName}'` };
   } catch (err) {
     if (worker) await worker.terminate();
     console.error('❌ [OCR ENGINE ERROR]:', err.message);
@@ -497,7 +521,7 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // 2. IMAGE UPLOAD HANDLER (Identical for ID & Passport)
+    // 2. IMAGE UPLOAD HANDLER (Uniform OCR across ID, License & Passports)
     if (messageType === 'image') {
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
@@ -506,23 +530,9 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          '🔎 *Analyzing Document Image*\n\nValidating document capture and routing to security registry. Please wait a moment...'
+          '🔎 *Analyzing Document Image*\n\nRunning automated document verification. Please wait a moment...'
         );
 
-        // Branch A: International Passport -> Store image for Guard HUD, route to desk
-        if (visitorSession.isPassport) {
-          visitorSession.step = 'COMPLETED';
-          console.log(`🛂 [PASSPORT UPLOAD] Storing image ${imageId} for desk inspection.`);
-          await triggerSecurityDivert(
-            senderPhone,
-            visitorSession,
-            'International Passport Document (Requires In-Person Physical Check at Desk)',
-            imageId
-          );
-          return;
-        }
-
-        // Branch B: South African ID / Driver's License -> Automated OCR Verification
         const imageBuffer = await downloadMetaImage(imageId);
 
         if (!imageBuffer) {
@@ -542,14 +552,16 @@ app.post('/webhook', async (req, res) => {
 
         visitorSession.step = 'COMPLETED';
 
-        if (!ocrResult.verified) {
-          console.warn(`❌ [OCR VERIFICATION FAILED] Reason: ${ocrResult.reason}`);
-          await triggerSecurityDivert(senderPhone, visitorSession, ocrResult.reason, imageId);
+        // Auto-Clear Path: Valid Smart ID, Driver's License, or SA Passport
+        if (ocrResult.verified) {
+          console.log(`✅ [OCR VERIFICATION PASSED] Issuing turnstile pass to ${senderPhone}`);
+          await generateTurnstilePass(senderPhone, visitorSession);
           return;
         }
 
-        console.log(`✅ [OCR VERIFICATION PASSED] Issuing pass to ${senderPhone}`);
-        await generateTurnstilePass(senderPhone, visitorSession);
+        // Divert Path: Foreign Passports, unverified formats, or blurry captures
+        console.warn(`⚠️ [INSPECTION DIVERT] Reason: ${ocrResult.reason}`);
+        await triggerSecurityDivert(senderPhone, visitorSession, ocrResult.reason, imageId);
         return;
       }
     }
@@ -565,7 +577,7 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by comma:\n*Example:* Sipho Dlamini, 0821234567`
+          `🏠 *Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
         );
         return;
       }
@@ -660,12 +672,11 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Visitor Session: Validate ID or Passport format (Identical User Experience)
+      // Visitor Session: Validate ID or Passport format
       const visSession = visitorSessions.get(senderPhone);
       if (visSession && visSession.step === 'AWAITING_ID_NUMBER') {
         const sanitizedId = cleanText.replace(/[\s\-\.]/g, '');
 
-        // Detect Passport (alphanumeric 6-12 chars containing letters) vs SA ID (13 digits)
         const isPassport = /^[A-Z0-9]{6,12}$/i.test(sanitizedId) && /[A-Z]/i.test(sanitizedId);
         const isNumeric13 = /^\d{13}$/.test(sanitizedId);
 
@@ -676,8 +687,8 @@ app.post('/webhook', async (req, res) => {
 
           await sendWhatsAppMessage(
             senderPhone,
-            `✅ *Passport Recorded (${maskID(sanitizedId)})*\n\n` +
-              `Please upload a clear photo of your *Passport Identity Page* to complete your arrival record.`
+            `✅ *Passport Number Recorded (${maskID(sanitizedId)})*\n\n` +
+              `Please upload a clear photo of your *Passport Identity Page* for automated verification.`
           );
           return;
         }
@@ -738,7 +749,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// GUARD NOTEPAD HUD & OVERRIDE API (With Document Image Inspection)
+// GUARD NOTEPAD HUD & OVERRIDE API
 // ============================================================================
 app.get('/security/live', (req, res) => {
   const alertsList = Array.from(securityAlerts.values()).reverse();
@@ -851,7 +862,7 @@ app.post('/security/assisted-clear', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'Ponte Concierge Unified Flow', status: 'ONLINE', time: new Date().toISOString() });
+  res.json({ service: 'Ponte Concierge Unified Engine', status: 'ONLINE', time: new Date().toISOString() });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
