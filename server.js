@@ -26,7 +26,7 @@ const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhon
 const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, accessType, zone, idNumber, isPassport }
 const issuedPasses = new Map();     // passToken -> { passToken, visitorName, visitorPhone, hostPhone, hostUnit, zone, validUntil, status, entries: [] }
 const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid, collectedAt, deliveredAt, completedAt }
-const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId }
+const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId, expiresAt }
 
 // Seed default verified test resident
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
@@ -51,7 +51,7 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
 }
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE
+// FUZZY OCR INSPECTION ENGINE (Smart ID, License, SA Passport & Foreign Passports)
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
@@ -70,13 +70,10 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
       text.includes('IDENTITY') || 
       text.includes('PASSPORT') || 
       text.includes('DRIVING') || 
-      text.includes('BESTUURS') ||
-      text.includes('LISENSIE') ||
       text.includes('LICENCE') ||
-      text.includes('SADC') ||
-      text.includes('PERMIT') ||
       text.includes('P<ZAF') || 
-      text.includes('<<<<');
+      text.includes('<<<<') ||
+      text.includes('P<');
 
     if (!hasDocKeywordsCheck(rawText)) {
       const rotatedBuffer = await preprocessDocumentImage(imageBuffer, 90);
@@ -115,23 +112,37 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
     });
 
     const hasSignificantNameMatch = tokenMatchResults.some(result => result === true);
-    const hasDocKeywords = hasDocKeywordsCheck(rawText);
     const isSAPassport = (rawText.includes('P<ZAF') || (rawText.includes('SOUTH AFRICA') && rawText.includes('PASSPORT')));
-    const isSADocument = hasDocKeywords && (rawText.includes('SOUTH AFRICA') || rawText.includes('SUID-AFRIKA') || rawText.includes('SADC') || isSAPassport);
+    const isMRZPassport = rawText.includes('P<') || rawText.includes('<<<<') || rawText.includes('PASSPORT');
+    const isSADocument = (rawText.includes('SOUTH AFRICA') || rawText.includes('SUID-AFRIKA') || isSAPassport);
 
+    // 1. South African ID or SA Passport Match -> Auto-Pass
     if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && isSADocument) {
-      return { verified: true, reason: 'MATCH_CONFIRMED' };
+      return { verified: true, reason: 'SA_DOC_MATCH_CONFIRMED' };
     } 
-    
-    if (rawText.includes('PASSPORT') || rawText.includes('<<<<') || rawText.includes('P<')) {
-      return { verified: false, reason: 'International Passport Document (Requires In-Person Physical Check at Desk)' };
+
+    // 2. Foreign Passport with Confirmed Passport Number Match -> Auto-Pass
+    if (isMRZPassport && !isSAPassport && fullIdMatch) {
+      return { 
+        verified: true, 
+        reason: 'FOREIGN_PASSPORT_MRZ_VERIFIED',
+        isForeign: true 
+      };
     }
 
-    if (!hasDocKeywords && !fullIdMatch && !hasSignificantNameMatch) {
-      return { verified: false, reason: 'Invalid or non-document image uploaded (e.g. random photo/object)' };
+    // 3. Foreign Passport with Mismatch or Unclear Number -> Divert to HUD
+    if (isMRZPassport && !fullIdMatch) {
+      return { 
+        verified: false, 
+        reason: 'Foreign Passport unverified by OCR. Visual check required on Guard HUD.' 
+      };
     }
 
-    return { verified: false, reason: `Document mismatch. Extracted text did not verify against resident invite for '${declaredName}'` };
+    if (!hasDocKeywordsCheck(rawText) && !fullIdMatch && !hasSignificantNameMatch) {
+      return { verified: false, reason: 'Invalid or non-document image uploaded' };
+    }
+
+    return { verified: false, reason: `Document mismatch for '${declaredName}'. Physical check required.` };
   } catch (err) {
     if (worker) await worker.terminate();
     return { verified: false, reason: 'OCR processing error or unreadable image' };
@@ -312,7 +323,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption) {
 }
 
 // ============================================================================
-// PASS GENERATION & 24H COME-AND-GO RECORDING
+// PASS GENERATION & 24H CREDENTIAL REGISTRATION
 // ============================================================================
 async function generateTurnstilePass(visitorPhone, visitorData) {
   const zoneTag = visitorData.zone === 'RETAIL_PARKING' ? 'ZONE_RETAIL_PARKING' : 'ZONE_FULL_RESIDENTIAL';
@@ -377,7 +388,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
 }
 
 // ============================================================================
-// SECURITY / RECEPTION DIVERT ENGINE (Inspection required)
+// SECURITY / RECEPTION DIVERT ENGINE (Inspection Required)
 // ============================================================================
 async function triggerSecurityDivert(visitorPhone, visitorData, failReason, mediaId = null) {
   const alertId = `ALT-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -392,7 +403,9 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason, medi
     timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
     zone: visitorData.zone || 'FULL_RESIDENTIAL',
     status: 'PENDING_MANUAL_REVIEW',
-    mediaId: mediaId
+    mediaId: mediaId,
+    // POPIA Escrow: 24h pass validity + 24h post-cycle retention buffer = 48h
+    expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
   });
 
   await sendWhatsAppMessage(
@@ -445,7 +458,7 @@ async function broadcastRunnerJob(job) {
 }
 
 // ============================================================================
-// PAYSTACK WEBHOOK LISTENER (Payment Confirmed -> Instant Dispatch)
+// PAYSTACK WEBHOOK (Payment Confirmed -> Checks Courier PIN & Dispatches)
 // ============================================================================
 app.post('/paystack/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -461,10 +474,16 @@ app.post('/paystack/webhook', async (req, res) => {
         job.status = 'PAID_AWAITING_CLAIM';
         job.paidAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
 
+        // Check if note includes a 4-6 digit numeric code (Courier OTP/PIN)
+        const hasPin = /\b\d{4,6}\b/.test(job.details);
+        const pinReminder = hasPin 
+          ? '' 
+          : `\n\n⚠️ *REMINDER:* If your courier requires a release PIN/OTP (e.g., Takealot, Checkers Sixty60), please text it to your runner directly once claimed.`;
+
         await sendWhatsAppMessage(
           job.hostPhone,
           `✅ *Payment Confirmed (R35.00)*\n\n` +
-            `Task *#${job.jobId}* is funded. Broadcasters have notified the active runner roster.`
+            `Task *#${job.jobId}* is funded and dispatched to the active runner roster.${pinReminder}`
         );
 
         await broadcastRunnerJob(job);
@@ -489,7 +508,6 @@ app.get('/api/turnstile/scan', async (req, res) => {
 
   console.log(`⚡ [TURNSTILE ACCESS GRANTED] ${pass.visitorName} scanned ${token} at ${nowTime}`);
 
-  // Notify host automatically of physical entry
   if (pass.hostPhone) {
     await sendWhatsAppMessage(
       pass.hostPhone,
@@ -500,6 +518,37 @@ app.get('/api/turnstile/scan', async (req, res) => {
 
   res.json({ access: 'GRANTED', guest: pass.visitorName, zone: pass.zone, time: nowTime });
 });
+
+// ============================================================================
+// AUTOMATED POPIA RETENTION SWEEPER (Runs Hourly to Purge Expired Artifacts)
+// ============================================================================
+setInterval(() => {
+  const now = new Date();
+  let purgedCount = 0;
+
+  for (const [alertId, alert] of securityAlerts.entries()) {
+    if (alert.expiresAt && new Date(alert.expiresAt) <= now) {
+      if (alert.mediaId) {
+        delete alert.mediaId; // Shred document image reference
+        purgedCount++;
+      }
+      alert.status = 'ARCHIVED_PURGED';
+    }
+  }
+
+  for (const [token, pass] of issuedPasses.entries()) {
+    if (pass.validUntil) {
+      const purgeWindow = new Date(new Date(pass.validUntil).getTime() + 24 * 60 * 60 * 1000);
+      if (now >= purgeWindow) {
+        issuedPasses.delete(token);
+      }
+    }
+  }
+
+  if (purgedCount > 0) {
+    console.log(`🔒 [POPIA PURGE] Permanently shredded ${purgedCount} expired verification document images.`);
+  }
+}, 60 * 60 * 1000);
 
 // ============================================================================
 // WEBHOOK VERIFICATION (GET)
@@ -660,7 +709,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Step 1: Runner collects from courier/guest directly -> alerts resident automatically
+      // Step 1: Runner collects from courier/guest -> alerts resident
       if (buttonId.startsWith('JOB_COLLECTED_')) {
         const jobId = buttonId.replace('JOB_COLLECTED_', '');
         const job = runnerJobs.get(jobId);
@@ -669,14 +718,12 @@ app.post('/webhook', async (req, res) => {
         job.status = 'IN_TRANSIT';
         job.collectedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
 
-        // Alert resident of physical pickup
         await sendWhatsAppMessage(
           job.hostPhone,
           `🏃‍♂️ *Runner En Route to Your Unit!*\n\n` +
             `Ponte Runner (${senderPhone}) has met the courier/guest and is heading up to *Unit ${job.unit}*.`
         );
 
-        // Give runner delivery button
         await sendInteractiveButtons(
           senderPhone,
           `TASK #${jobId} IN TRANSIT`,
@@ -688,7 +735,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Step 2: Runner reports delivery at unit door
+      // Step 2: Runner marks delivered at unit door
       if (buttonId.startsWith('JOB_DELIVERED_')) {
         const jobId = buttonId.replace('JOB_DELIVERED_', '');
         const job = runnerJobs.get(jobId);
@@ -716,7 +763,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Step 3: Resident verifies receipt -> unlocks runner payout
+      // Step 3: Resident confirms receipt -> unlocks runner payout
       if (buttonId.startsWith('RESIDENT_CONFIRM_')) {
         const jobId = buttonId.replace('RESIDENT_CONFIRM_', '');
         const job = runnerJobs.get(jobId);
@@ -754,7 +801,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Exit Authorization (Only Resident Can Trigger) -> Lights up Guard HUD
+      // Exit Authorization (Only Resident Can Authorize)
       if (buttonId.startsWith('AUTH_EXIT_')) {
         const guestPhone = buttonId.replace('AUTH_EXIT_', '');
         const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'Resident' };
@@ -769,7 +816,8 @@ app.post('/webhook', async (req, res) => {
           reason: `Exit Authorized by Host (Unit ${hostProfile.unit}). Departing estate.`,
           timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
           zone: 'EGRESS_CLEARANCE',
-          status: 'PENDING_MANUAL_REVIEW'
+          status: 'PENDING_MANUAL_REVIEW',
+          expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
         });
 
         await sendWhatsAppMessage(
@@ -819,7 +867,6 @@ app.post('/webhook', async (req, res) => {
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
-      // Block visitors from self-authorizing exit
       if (cleanText === 'exit' || cleanText === 'checkout' || cleanText === 'leave') {
         const isVisitor = visitorSessions.has(senderPhone);
         if (isVisitor) {
@@ -895,7 +942,7 @@ app.post('/webhook', async (req, res) => {
           if (existing.role === 'RESIDENT') {
             await sendWhatsAppMessage(
               senderPhone,
-              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite a guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass`
+              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass`
             );
             return;
           }
@@ -1036,7 +1083,7 @@ app.post('/webhook', async (req, res) => {
 app.get('/security/live', (req, res) => {
   const alertsList = Array.from(securityAlerts.values()).reverse();
   const rows = alertsList.map(a => `
-    <tr style="border-bottom: 1px solid #334155; ${a.status === 'APPROVED' || a.status === 'EXIT_CONFIRMED' ? 'opacity: 0.5;' : ''}">
+    <tr style="border-bottom: 1px solid #334155; ${a.status === 'APPROVED' || a.status === 'EXIT_CONFIRMED' || a.status === 'ARCHIVED_PURGED' ? 'opacity: 0.5;' : ''}">
       <td style="padding: 12px; font-weight: bold; color: #38bdf8;">${a.alertId}</td>
       <td style="padding: 12px;">${a.timestamp}</td>
       <td style="padding: 12px;">
@@ -1046,7 +1093,7 @@ app.get('/security/live', (req, res) => {
       </td>
       <td style="padding: 12px; color: ${a.zone === 'EGRESS_CLEARANCE' ? '#eab308' : '#f87171'};">
         ${a.reason}<br>
-        ${a.mediaId ? `<span style="font-size: 11px; color: #38bdf8;">📷 Document attached</span>` : ''}
+        ${a.mediaId ? `<span style="font-size: 11px; color: #38bdf8;">📷 Document attached (Audit Escrow)</span>` : ''}
       </td>
       <td style="padding: 12px;"><span style="background: ${a.zone === 'RETAIL_PARKING' ? '#eab308' : (a.zone === 'EGRESS_CLEARANCE' ? '#f97316' : '#22c55e')}; color: #000; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">${a.zone}</span></td>
       <td style="padding: 12px;">
@@ -1116,6 +1163,9 @@ app.get('/security/override', async (req, res) => {
 
   if (action === 'APPROVE') {
     alert.status = 'APPROVED';
+    // Retain mediaId in audit escrow until TTL expires
+    alert.expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+
     await generateTurnstilePass(alert.visitorPhone, {
       visitorName: alert.visitorName,
       idNumber: alert.idNumber || 'PHYSICAL_CHECK_PASSED',
