@@ -11,10 +11,13 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ponte_secure_token_2026';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
-// Paystack Integration Keys
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_d6d2799487eed5ab4923196391ee28601e7f0dd6';
+// Paystack Live Integration Keys
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_R8qsWbvo7b'; // 100% GoTyme Bank
 
-// Operational Dispatch Numbers
+// Operational Hotline & Dispatch Numbers
+const ADMIN_REPORT_PHONE = '27715720458';
+const SUPPORT_HOTLINE_PHONE = '27734938495'; // Test line & Support/Feedback inbox
 const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27734938495';
 const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458';
 
@@ -27,9 +30,17 @@ const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, 
 const issuedPasses = new Map();     // passToken -> { passToken, visitorName, visitorPhone, hostPhone, hostUnit, zone, validUntil, status, entries: [] }
 const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid, collectedAt, deliveredAt, completedAt }
 const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId, expiresAt }
+const supportFeedbackLog = [];      // [{ timestamp, senderPhone, text }]
 
-// Seed default verified test resident
+// 1. Pre-seed Verified Resident
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
+
+// 2. Pre-seed Closed-Group Runners
+userProfiles.set('27832778743', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Kaycee' });
+userProfiles.set('27822229285', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Vusi' });
+userProfiles.set('27688814679', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Musa' });
+userProfiles.set('27656206712', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Faith' });
+userProfiles.set('27734938495', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Ponte Support & Standby Runner' });
 
 // ============================================================================
 // IMAGE NORMALIZATION (Sharp)
@@ -51,7 +62,7 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
 }
 
 // ============================================================================
-// FUZZY OCR INSPECTION ENGINE (Smart ID, License, SA Passport & Foreign Passports)
+// FUZZY OCR INSPECTION ENGINE
 // ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
@@ -169,16 +180,17 @@ async function downloadMetaImage(imageId) {
 }
 
 // ============================================================================
-// PAYSTACK CHECKOUT GENERATOR (R35.00 Launch Promo)
+// PAYSTACK CHECKOUT GENERATOR (With Automatic 100% GoTyme Bank Split)
 // ============================================================================
 async function generatePaystackCheckout(residentPhone, unit, jobId) {
   try {
     const payload = {
       email: `resident.unit${unit}@pontecity.co.za`,
-      amount: 3500,
+      amount: 3500, // R35.00 in cents
       currency: 'ZAR',
       reference: `PC-${jobId}-${Date.now().toString().slice(-4)}`,
-      callback_url: `https://wa.me/27734938495`,
+      callback_url: `https://wa.me/${SUPPORT_HOTLINE_PHONE}`,
+      split_code: PAYSTACK_SPLIT_CODE, // Automatically channels 100% to GoTyme Bank
       metadata: {
         jobId: jobId,
         phone: residentPhone,
@@ -358,7 +370,6 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
     ? '⚠️ *Zone:* PARKING & RETAIL ONLY (Turnstiles Restricted)'
     : '✅ *Zone:* FULL RESIDENTIAL (Turnstiles & Lifts Active)';
 
-  // Send pass to guest with come-and-go notice
   await sendWhatsAppImage(
     visitorPhone,
     qrDataUrl,
@@ -371,7 +382,6 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
       `_Scan at turnstile readers. You may enter and exit freely during your visit._`
   );
 
-  // Send arrival protocol to host
   if (visitorData.hostPhone) {
     await sendInteractiveButtons(
       visitorData.hostPhone,
@@ -388,7 +398,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
 }
 
 // ============================================================================
-// SECURITY / RECEPTION DIVERT ENGINE (Inspection Required)
+// SECURITY / RECEPTION DIVERT ENGINE
 // ============================================================================
 async function triggerSecurityDivert(visitorPhone, visitorData, failReason, mediaId = null) {
   const alertId = `ALT-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -404,7 +414,6 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason, medi
     zone: visitorData.zone || 'FULL_RESIDENTIAL',
     status: 'PENDING_MANUAL_REVIEW',
     mediaId: mediaId,
-    // POPIA Escrow: 24h pass validity + 24h post-cycle retention buffer = 48h
     expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
   });
 
@@ -458,7 +467,7 @@ async function broadcastRunnerJob(job) {
 }
 
 // ============================================================================
-// PAYSTACK WEBHOOK (Payment Confirmed -> Checks Courier PIN & Dispatches)
+// PAYSTACK WEBHOOK (Payment Confirmed -> Instant Dispatch)
 // ============================================================================
 app.post('/paystack/webhook', async (req, res) => {
   res.sendStatus(200);
@@ -474,7 +483,6 @@ app.post('/paystack/webhook', async (req, res) => {
         job.status = 'PAID_AWAITING_CLAIM';
         job.paidAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
 
-        // Check if note includes a 4-6 digit numeric code (Courier OTP/PIN)
         const hasPin = /\b\d{4,6}\b/.test(job.details);
         const pinReminder = hasPin 
           ? '' 
@@ -520,18 +528,103 @@ app.get('/api/turnstile/scan', async (req, res) => {
 });
 
 // ============================================================================
-// AUTOMATED POPIA RETENTION SWEEPER (Runs Hourly to Purge Expired Artifacts)
+// AUTOMATED DAILY AUDIT & PAYMENT REPORT GENERATOR
 // ============================================================================
-setInterval(() => {
-  const now = new Date();
-  let purgedCount = 0;
+function generateAuditSummary() {
+  const jobsList = Array.from(runnerJobs.values());
+  const completedJobs = jobsList.filter(j => j.status === 'COMPLETED_VERIFIED');
+  const paidJobs = jobsList.filter(j => j.paidAt);
 
+  const totalTasks = jobsList.length;
+  const totalPaidCount = paidJobs.length;
+  const totalCompletedCount = completedJobs.length;
+
+  const grossRevenue = totalPaidCount * 35.00;
+  const totalRunnerPayouts = totalCompletedCount * 25.00;
+  const platformMargin = totalCompletedCount * 10.00;
+  const communityRebate = totalCompletedCount * 0.50;
+
+  const runnerStats = {};
+  for (const job of completedJobs) {
+    const runnerPhone = job.claimedBy || 'Unknown';
+    const runnerProfile = userProfiles.get(runnerPhone);
+    const runnerName = runnerProfile ? runnerProfile.fullName : runnerPhone;
+    if (!runnerStats[runnerName]) {
+      runnerStats[runnerName] = { runs: 0, earnings: 0.0 };
+    }
+    runnerStats[runnerName].runs += 1;
+    runnerStats[runnerName].earnings += 25.00;
+  }
+
+  return {
+    date: new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+    totalTasks,
+    totalPaidCount,
+    totalCompletedCount,
+    grossRevenue,
+    totalRunnerPayouts,
+    platformMargin,
+    communityRebate,
+    runnerStats,
+    recentFeedback: supportFeedbackLog.slice(-5)
+  };
+}
+
+async function sendDailyAuditReport() {
+  const report = generateAuditSummary();
+  let runnerBreakdownText = '';
+
+  for (const [name, stats] of Object.entries(report.runnerStats)) {
+    runnerBreakdownText += `  • *${name}:* ${stats.runs} run(s) -> R${stats.earnings.toFixed(2)}\n`;
+  }
+
+  if (!runnerBreakdownText) {
+    runnerBreakdownText = `  • _No verified runs completed today._\n`;
+  }
+
+  let feedbackText = '';
+  if (report.recentFeedback.length > 0) {
+    feedbackText = `\n💬 *Recent Suggestions / Hotline Calls:*\n` +
+      report.recentFeedback.map(f => `  • [${f.senderPhone}]: "${f.text}"`).join('\n') + `\n`;
+  }
+
+  const message =
+    `📊 *PONTE CONCIERGE DAILY AUDIT REPORT*\n` +
+    `📅 *Date:* ${report.date}\n\n` +
+    `• *Total Tasks Created:* ${report.totalTasks}\n` +
+    `• *Tasks Paid (Paystack):* ${report.totalPaidCount}\n` +
+    `• *Tasks Verified Completed:* ${report.totalCompletedCount}\n\n` +
+    `💰 *Financial Reconciliations:*\n` +
+    `• *Gross Revenue (R35/task):* R${report.grossRevenue.toFixed(2)}\n` +
+    `• *Runner Payouts Owed (R25/task):* R${report.totalRunnerPayouts.toFixed(2)}\n` +
+    `• *Platform Margin (R10/task):* R${report.platformMargin.toFixed(2)}\n` +
+    `• *Dlala Nje Community Fund (5%):* R${report.communityRebate.toFixed(2)}\n\n` +
+    `🏃 *Runner Shift Earnings:*\n${runnerBreakdownText}` +
+    feedbackText +
+    `\n_Generated automatically by Ponte Concierge Audit Engine._`;
+
+  console.log(`📤 Dispatching Daily Audit Report to ${ADMIN_REPORT_PHONE}...`);
+  await sendWhatsAppMessage(ADMIN_REPORT_PHONE, message);
+}
+
+// Scheduled Cron Check: Runs hourly, triggers daily summary at 20:00 SAST
+let lastReportDate = '';
+setInterval(async () => {
+  const now = new Date();
+  const utcHours = now.getUTCHours();
+  const sastHours = (utcHours + 2) % 24;
+  const todayStr = now.toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+
+  // 1. Send Daily Report at 20:00 SAST
+  if (sastHours === 20 && lastReportDate !== todayStr) {
+    lastReportDate = todayStr;
+    await sendDailyAuditReport();
+  }
+
+  // 2. POPIA 24h+24h Sweeper
   for (const [alertId, alert] of securityAlerts.entries()) {
     if (alert.expiresAt && new Date(alert.expiresAt) <= now) {
-      if (alert.mediaId) {
-        delete alert.mediaId; // Shred document image reference
-        purgedCount++;
-      }
+      if (alert.mediaId) delete alert.mediaId;
       alert.status = 'ARCHIVED_PURGED';
     }
   }
@@ -539,16 +632,16 @@ setInterval(() => {
   for (const [token, pass] of issuedPasses.entries()) {
     if (pass.validUntil) {
       const purgeWindow = new Date(new Date(pass.validUntil).getTime() + 24 * 60 * 60 * 1000);
-      if (now >= purgeWindow) {
-        issuedPasses.delete(token);
-      }
+      if (now >= purgeWindow) issuedPasses.delete(token);
     }
   }
-
-  if (purgedCount > 0) {
-    console.log(`🔒 [POPIA PURGE] Permanently shredded ${purgedCount} expired verification document images.`);
-  }
 }, 60 * 60 * 1000);
+
+// Browser Endpoint for Real-time Audit Review
+app.get('/admin/daily-report', (req, res) => {
+  const report = generateAuditSummary();
+  res.json({ status: 'SUCCESS', report });
+});
 
 // ============================================================================
 // WEBHOOK VERIFICATION (GET)
@@ -596,7 +689,7 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (buttonId === 'ROLE_RUNNER') {
-        userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date() });
+        userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date(), fullName: 'Ponte Resident Runner' });
         await sendWhatsAppMessage(senderPhone, `🏃 *Ponte Runner Roster Activated*`);
         return;
       }
@@ -637,7 +730,7 @@ app.post('/webhook', async (req, res) => {
         });
 
         const promptText = taskType === 'PARCEL_COLLECTION'
-          ? `📝 *Delivery Details & Courier PIN:*\n\nReply with what to collect and courier details:\n*(e.g., "Main Gate - Checkers Sixty60 under Rudi, PIN: 4812")*`
+          ? `📝 *Delivery Details & Courier PIN:*\n\nReply with what to collect, courier company, and release PIN:\n*(e.g., "Main Gate - Checkers Sixty60 under Rudi, PIN: 4812")*`
           : `📝 *Escort Details:*\n\nReply with who and where to meet:\n*(e.g., "Lobby turnstiles - Thabo 0821234567")*`;
 
         await sendWhatsAppMessage(senderPhone, promptText);
@@ -696,7 +789,7 @@ app.post('/webhook', async (req, res) => {
           `• *Type:* ${job.taskType}\n` +
           `• *Destination:* Unit ${job.unit} (${job.hostName}: ${job.hostPhone})\n` +
           `📌 *Details:* _${job.details}_\n\n` +
-          `Meet the courier/guest directly. Tap below once collected:`,
+          `Meet courier/guest directly at the gate. Tap below once collected:`,
           [
             { id: `JOB_COLLECTED_${jobId}`, title: 'Collected & En Route 🏃‍♂️' }
           ]
@@ -867,6 +960,40 @@ app.post('/webhook', async (req, res) => {
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
+      // On-demand Admin Daily Report command
+      if (cleanText === 'report' && senderPhone === ADMIN_REPORT_PHONE) {
+        await sendDailyAuditReport();
+        return;
+      }
+
+      // Support & Suggestions Hotline Flow
+      if (cleanText.startsWith('suggest') || cleanText.startsWith('support') || cleanText.startsWith('help')) {
+        const suggestionText = rawText.replace(/^(suggest|support|help)[\s:]*/i, '').trim();
+        if (suggestionText) {
+          supportFeedbackLog.push({
+            timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+            senderPhone,
+            text: suggestionText
+          });
+          await sendWhatsAppMessage(
+            senderPhone,
+            `🙏 *Thank You for Your Feedback!*\n\nYour suggestion has been logged with Ponte Concierge operations:\n_"${suggestionText}"_`
+          );
+          // Ping admin directly
+          await sendWhatsAppMessage(
+            ADMIN_REPORT_PHONE,
+            `💡 *NEW CONCIERGE HOTLINE MESSAGE*\nFrom: ${senderPhone}\nMessage: "${suggestionText}"`
+          );
+          return;
+        } else {
+          await sendWhatsAppMessage(
+            senderPhone,
+            `💡 *Ponte Support & Hotline*\n\nTo submit a suggestion, report an issue, or ask a question, reply starting with *suggest* or *help* followed by your message.\n\n*Example:* suggest Could runners also help with key handovers?`
+          );
+          return;
+        }
+      }
+
       if (cleanText === 'exit' || cleanText === 'checkout' || cleanText === 'leave') {
         const isVisitor = visitorSessions.has(senderPhone);
         if (isVisitor) {
@@ -926,7 +1053,7 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (cleanText === '2') {
-        userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date() });
+        userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date(), fullName: 'Ponte Resident Runner' });
         await sendWhatsAppMessage(senderPhone, `🏃 *Ponte Runner Roster Activated*`);
         return;
       }
@@ -942,12 +1069,15 @@ app.post('/webhook', async (req, res) => {
           if (existing.role === 'RESIDENT') {
             await sendWhatsAppMessage(
               senderPhone,
-              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass`
+              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass\n• Reply *help* for hotline/suggestions`
             );
             return;
           }
           if (existing.role === 'RUNNER') {
-            await sendWhatsAppMessage(senderPhone, `🏃 *Welcome back Ponte Runner!*\n\nYou are on standby for tasks.`);
+            await sendWhatsAppMessage(
+              senderPhone,
+              `🏃 *Welcome back ${existing.fullName}!* (Ponte Runner)\n\nYou are on active standby for dispatches.\n• Reply *help* to contact admin.`
+            );
             return;
           }
         }
@@ -1070,7 +1200,7 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      await sendWhatsAppMessage(senderPhone, `👋 *Ponte Concierge*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort`);
+      await sendWhatsAppMessage(senderPhone, `👋 *Ponte Concierge*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *help* for hotline/suggestions`);
     }
   } catch (error) {
     console.error('❌ Webhook error:', error);
@@ -1163,7 +1293,6 @@ app.get('/security/override', async (req, res) => {
 
   if (action === 'APPROVE') {
     alert.status = 'APPROVED';
-    // Retain mediaId in audit escrow until TTL expires
     alert.expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
 
     await generateTurnstilePass(alert.visitorPhone, {
@@ -1209,7 +1338,7 @@ app.post('/security/assisted-clear', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'Ponte Concierge Streamlined POC', status: 'ONLINE', time: new Date().toISOString() });
+  res.json({ service: 'Ponte Concierge Live Pilot Engine', status: 'ONLINE', time: new Date().toISOString() });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
