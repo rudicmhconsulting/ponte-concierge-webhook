@@ -1,6 +1,7 @@
 const express = require('express');
 const { createWorker } = require('tesseract.js');
 const sharp = require('sharp');
+const { GoogleGenAI, Type } = require('@google/genai');
 
 const app = express();
 app.use(express.json());
@@ -9,20 +10,32 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ponte_secure_token_2026';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
-// Paystack Live Integration Keys
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_R8qsWbvo7b'; // 100% GoTyme Bank
+// ============================================================================
+// DUAL-LINE WABA IDENTIFIERS (Ponte Concierges WABA 1799638264570073)
+// ============================================================================
+const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)
+const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448931934515007'; // 072 949 4561 (AI Support & Feedback)
 
-// Operational Hotline & Dispatch Numbers
+// Operational Hotline & Admin Phones
 const ADMIN_REPORT_PHONE = '27715720458';
-const SUPPORT_HOTLINE_PHONE = '27734938495'; // Test line & Support/Feedback inbox
-const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27734938495';
+const RECEPTION_WA_GROUP = process.env.RECEPTION_WA_GROUP || '27715720458';
 const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458';
 
 // ============================================================================
-// IN-MEMORY STATE STORES & AUDIT REGISTRY
+// PAYSTACK LIVE CONFIGURATION (Ponte Concierges Profile 2094725)
+// ============================================================================
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG'; // 100% GoTyme Bank
+const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
+
+// ============================================================================
+// GEMINI CLIENT SETUP
+// ============================================================================
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// ============================================================================
+// IN-MEMORY STORES & QUEUES
 // ============================================================================
 const userProfiles = new Map();     // phone -> { role, registeredAt, unit, fullName }
 const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType, zone, taskType, guestPhone }
@@ -30,20 +43,201 @@ const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, 
 const issuedPasses = new Map();     // passToken -> { passToken, visitorName, visitorPhone, hostPhone, hostUnit, zone, validUntil, status, entries: [] }
 const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid, collectedAt, deliveredAt, completedAt }
 const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId, expiresAt }
-const supportFeedbackLog = [];      // [{ timestamp, senderPhone, text }]
+const customerBacklogQueue = [];    // [{ id, rawFeedback, userStory, businessValue, senderPhone, status, submittedAt, submittedDate }]
 
-// 1. Pre-seed Verified Resident
+// 1. Seed Verified Resident
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
 
-// 2. Pre-seed Closed-Group Runners
+// 2. Seed Runners
 userProfiles.set('27832778743', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Kaycee' });
 userProfiles.set('27822229285', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Vusi' });
 userProfiles.set('27688814679', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Musa' });
 userProfiles.set('27656206712', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Faith' });
-userProfiles.set('27734938495', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Ponte Support & Standby Runner' });
 
 // ============================================================================
-// IMAGE NORMALIZATION (Sharp)
+// OUTBOUND META GRAPH API HELPERS
+// ============================================================================
+async function sendWhatsAppMessage(recipientPhone, messageText, senderPhoneId = PHONE_ID_MAIN) {
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipientPhone,
+      type: 'text',
+      text: { body: messageText },
+    };
+    const res = await fetch(`https://graph.facebook.com/v18.0/${senderPhoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    return await res.json();
+  } catch (error) {
+    console.error('❌ Error in sendWhatsAppMessage:', error.message);
+  }
+}
+
+async function sendInteractiveButtons(recipientPhone, headerText, bodyText, buttons, footerText = '', senderPhoneId = PHONE_ID_MAIN) {
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipientPhone,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        header: headerText ? { type: 'text', text: headerText } : undefined,
+        body: { text: bodyText },
+        footer: footerText ? { text: footerText } : undefined,
+        action: {
+          buttons: buttons.map((b) => ({
+            type: 'reply',
+            reply: { id: b.id, title: b.title.substring(0, 20) },
+          })),
+        },
+      },
+    };
+    const res = await fetch(`https://graph.facebook.com/v18.0/${senderPhoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    return await res.json();
+  } catch (error) {
+    console.error('❌ Error in sendInteractiveButtons:', error.message);
+  }
+}
+
+async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneId = PHONE_ID_MAIN) {
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipientPhone,
+      type: 'image',
+      image: { link: imageUrl, caption: caption },
+    };
+    const res = await fetch(`https://graph.facebook.com/v18.0/${senderPhoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    return await res.json();
+  } catch (error) {
+    console.error('❌ Error in sendWhatsAppImage:', error.message);
+  }
+}
+
+// ============================================================================
+// GEMINI SUPPORT & USER STORY GENERATOR
+// ============================================================================
+async function handleSupportAndBacklogAgent(senderPhone, userMessage) {
+  try {
+    const prompt = `
+You are the AI Concierge Support & Product Agent for "Ponte Concierge" at Ponte City, Johannesburg.
+A resident, runner, or visitor texted our dedicated support line (+27 72 949 4561):
+"${userMessage}"
+
+Key Operational Context:
+- Errand Service: R35 promo flat fee paid on WhatsApp via Paystack. Runners earn R25 on dual confirmation.
+- Visitor Clearance: 100% digital on WhatsApp, optical QR passes valid for 24 hours.
+- Front Desk / Reception Hours: 07:00 to 16:00, Monday to Friday. Security desk is manned 24/7.
+- Escalations: Security issues, missing parcels, or turnstile blocks must trigger an alert to the operations admin.
+
+Instructions:
+1. Classify intent:
+   - "SUPPORT_QUERY": General questions, lost pass, reception hours, runner status.
+   - "FEATURE_REQUEST": Any suggestion, feedback, idea, or complaint highlighting a missing feature.
+   - "COMPLAINT_CRITICAL": Unresolved runner dispute, payment issue, safety concern, or entry lockout.
+2. Reply concisely and warmly (max 3 sentences) suitable for WhatsApp.
+3. If it is a FEATURE_REQUEST:
+   - Formulate a clean Agile User Story: "As a [resident/runner/visitor], I want [capability] so that [benefit]."
+   - Estimate Business Value ("High", "Medium", "Low") based on residential convenience or revenue.
+   - Set status to "PENDING_APPROVAL".
+`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            category: { type: Type.STRING },
+            replyText: { type: Type.STRING },
+            userStory: { type: Type.STRING, nullable: true },
+            businessValue: { type: Type.STRING, nullable: true }
+          },
+          required: ['category', 'replyText']
+        }
+      }
+    });
+
+    const parsed = JSON.parse(response.text.trim());
+
+    // Reply to resident via the Support line (072)
+    await sendWhatsAppMessage(senderPhone, parsed.replyText, PHONE_ID_SUPPORT);
+
+    // Staging Feature Requests
+    if (parsed.category === 'FEATURE_REQUEST' && parsed.userStory) {
+      const storyItem = {
+        id: `STORY-${Date.now().toString().slice(-4)}`,
+        rawFeedback: userMessage,
+        userStory: parsed.userStory,
+        businessValue: parsed.businessValue || 'Medium',
+        senderPhone: senderPhone,
+        status: 'PENDING_APPROVAL',
+        submittedAt: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+        submittedDate: new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' })
+      };
+
+      customerBacklogQueue.push(storyItem);
+
+      await sendWhatsAppMessage(
+        ADMIN_REPORT_PHONE,
+        `💡 *NEW SUGGESTED USER STORY [${storyItem.id}]*\n\n` +
+        `• *Story:* ${storyItem.userStory}\n` +
+        `• *Value:* ${storyItem.businessValue}\n` +
+        `• *Source:* ${senderPhone}\n\n` +
+        `_Staged in /admin/backlog for review before Jaco's sync._`,
+        PHONE_ID_MAIN
+      );
+    }
+
+    // Critical escalation
+    if (parsed.category === 'COMPLAINT_CRITICAL') {
+      await sendWhatsAppMessage(
+        ADMIN_REPORT_PHONE,
+        `🚨 *CRITICAL HOTLINE ALERT*\n\n` +
+        `• *From:* ${senderPhone}\n` +
+        `• *Message:* "${userMessage}"\n` +
+        `• *Action:* Immediate dispatch check required.`,
+        PHONE_ID_MAIN
+      );
+    }
+
+  } catch (err) {
+    console.error('❌ AI Support Agent Error:', err.message);
+    await sendWhatsAppMessage(
+      senderPhone,
+      `Hello! Ponte Concierge Support has received your message. Our operational team will review it shortly.`,
+      PHONE_ID_SUPPORT
+    );
+  }
+}
+
+// ============================================================================
+// IMAGE NORMALIZATION & FUZZY OCR
 // ============================================================================
 async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
   try {
@@ -56,41 +250,31 @@ async function preprocessDocumentImage(rawBuffer, rotateAngle = 0) {
       .normalize()
       .toBuffer();
   } catch (err) {
-    console.warn('⚠️ Sharp pre-processing warning, falling back to raw buffer:', err.message);
+    console.warn('⚠️ Sharp pre-processing warning, using raw buffer:', err.message);
     return rawBuffer;
   }
 }
 
-// ============================================================================
-// FUZZY OCR INSPECTION ENGINE
-// ============================================================================
 async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
   let worker = null;
   try {
-    console.log(`🔍 [OCR] Inspecting ID/Doc: ${declaredId}, Declared Name: "${declaredName}"...`);
-    
     let processedBuffer = await preprocessDocumentImage(imageBuffer, 0);
     worker = await createWorker('eng');
     let ret = await worker.recognize(processedBuffer);
     let rawText = ret.data.text.toUpperCase();
 
-    const hasDocKeywordsCheck = (text) => 
-      text.includes('SOUTH AFRICA') || 
-      text.includes('SUID-AFRIKA') ||
-      text.includes('REPUBLIC') || 
-      text.includes('IDENTITY') || 
-      text.includes('PASSPORT') || 
-      text.includes('DRIVING') || 
-      text.includes('LICENCE') ||
-      text.includes('P<ZAF') || 
-      text.includes('<<<<') ||
-      text.includes('P<');
+    const hasDocKeywords = (text) => 
+      text.includes('SOUTH AFRICA') || text.includes('SUID-AFRIKA') ||
+      text.includes('REPUBLIC') || text.includes('IDENTITY') || 
+      text.includes('PASSPORT') || text.includes('DRIVING') || 
+      text.includes('LICENCE') || text.includes('P<ZAF') || 
+      text.includes('<<<<') || text.includes('P<');
 
-    if (!hasDocKeywordsCheck(rawText)) {
+    if (!hasDocKeywords(rawText)) {
       const rotatedBuffer = await preprocessDocumentImage(imageBuffer, 90);
       const retRotated = await worker.recognize(rotatedBuffer);
       const rotatedText = retRotated.data.text.toUpperCase();
-      if (hasDocKeywordsCheck(rotatedText)) rawText = rotatedText;
+      if (hasDocKeywords(rotatedText)) rawText = rotatedText;
     }
 
     await worker.terminate();
@@ -116,47 +300,28 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
       .split(/\s+/)
       .filter(t => t.length >= 3 && !stopWords.has(t));
 
-    const tokenMatchResults = declaredTokens.map(token => {
+    const hasSignificantNameMatch = declaredTokens.some(token => {
       if (rawText.includes(token)) return true;
-      const tokenStem = token.substring(0, Math.max(3, token.length - 1));
-      return rawText.includes(tokenStem);
+      const stem = token.substring(0, Math.max(3, token.length - 1));
+      return rawText.includes(stem);
     });
 
-    const hasSignificantNameMatch = tokenMatchResults.some(result => result === true);
     const isSAPassport = (rawText.includes('P<ZAF') || (rawText.includes('SOUTH AFRICA') && rawText.includes('PASSPORT')));
     const isMRZPassport = rawText.includes('P<') || rawText.includes('<<<<') || rawText.includes('PASSPORT');
     const isSADocument = (rawText.includes('SOUTH AFRICA') || rawText.includes('SUID-AFRIKA') || isSAPassport);
 
-    // 1. South African ID or SA Passport Match -> Auto-Pass
     if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && isSADocument) {
       return { verified: true, reason: 'SA_DOC_MATCH_CONFIRMED' };
     } 
 
-    // 2. Foreign Passport with Confirmed Passport Number Match -> Auto-Pass
     if (isMRZPassport && !isSAPassport && fullIdMatch) {
-      return { 
-        verified: true, 
-        reason: 'FOREIGN_PASSPORT_MRZ_VERIFIED',
-        isForeign: true 
-      };
+      return { verified: true, reason: 'FOREIGN_PASSPORT_MRZ_VERIFIED', isForeign: true };
     }
 
-    // 3. Foreign Passport with Mismatch or Unclear Number -> Divert to HUD
-    if (isMRZPassport && !fullIdMatch) {
-      return { 
-        verified: false, 
-        reason: 'Foreign Passport unverified by OCR. Visual check required on Guard HUD.' 
-      };
-    }
-
-    if (!hasDocKeywordsCheck(rawText) && !fullIdMatch && !hasSignificantNameMatch) {
-      return { verified: false, reason: 'Invalid or non-document image uploaded' };
-    }
-
-    return { verified: false, reason: `Document mismatch for '${declaredName}'. Physical check required.` };
+    return { verified: false, reason: `Document check required for '${declaredName}'. Physical check required.` };
   } catch (err) {
     if (worker) await worker.terminate();
-    return { verified: false, reason: 'OCR processing error or unreadable image' };
+    return { verified: false, reason: 'OCR unreadable or image error' };
   }
 }
 
@@ -174,29 +339,34 @@ async function downloadMetaImage(imageId) {
     const arrayBuffer = await imageRes.arrayBuffer();
     return Buffer.from(arrayBuffer);
   } catch (err) {
-    console.error('❌ [IMAGE DOWNLOAD ERROR]:', err.message);
+    console.error('❌ Image download error:', err.message);
     return null;
   }
 }
 
 // ============================================================================
-// PAYSTACK CHECKOUT GENERATOR (With Automatic 100% GoTyme Bank Split)
+// PAYSTACK DYNAMIC CHECKOUT (Workspace 2094725)
 // ============================================================================
 async function generatePaystackCheckout(residentPhone, unit, jobId) {
   try {
     const payload = {
-      email: `resident.unit${unit}@pontecity.co.za`,
-      amount: 3500, // R35.00 in cents
+      email: `resident.unit${unit}@ponteconcierge.co.za`,
+      amount: 3500, // R35.00
       currency: 'ZAR',
       reference: `PC-${jobId}-${Date.now().toString().slice(-4)}`,
-      callback_url: `https://wa.me/${SUPPORT_HOTLINE_PHONE}`,
-      split_code: PAYSTACK_SPLIT_CODE, // Automatically channels 100% to GoTyme Bank
+      callback_url: `https://wa.me/27810973478`,
+      split_code: PAYSTACK_SPLIT_CODE,
+      channels: ['card', 'eft', 'bank', 'qr', 'apple_pay', 'capitec_pay'],
       metadata: {
         jobId: jobId,
         phone: residentPhone,
         unit: unit,
         pricing: 'PROMO_R35',
-        service: 'PONTE_RUNNER_SERVICE'
+        service: 'PONTE_RUNNER_SERVICE',
+        custom_fields: [
+          { display_name: "Unit Number", variable_name: "unit_number", value: unit },
+          { display_name: "Task Reference", variable_name: "task_ref", value: `#${jobId}` }
+        ]
       }
     };
 
@@ -213,9 +383,10 @@ async function generatePaystackCheckout(residentPhone, unit, jobId) {
     if (data.status && data.data?.authorization_url) {
       return data.data.authorization_url;
     }
-    return `https://paystack.com/pay/ponte-runner-promo-unit-${unit}`;
+    return FALLBACK_PAYMENT_PAGE;
   } catch (err) {
-    return `https://paystack.com/pay/ponte-runner-promo-unit-${unit}`;
+    console.error('❌ Paystack Initialization Exception:', err.message);
+    return FALLBACK_PAYMENT_PAGE;
   }
 }
 
@@ -252,90 +423,7 @@ function maskID(idNumber) {
 }
 
 // ============================================================================
-// OUTBOUND META GRAPH API HELPERS
-// ============================================================================
-async function sendWhatsAppMessage(recipientPhone, messageText) {
-  try {
-    const payload = {
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: recipientPhone,
-      type: 'text',
-      text: { body: messageText },
-    };
-    const res = await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-    return await res.json();
-  } catch (error) {
-    console.error(`❌ Error in sendWhatsAppMessage:`, error.message);
-  }
-}
-
-async function sendInteractiveButtons(recipientPhone, headerText, bodyText, buttons, footerText = '') {
-  try {
-    const payload = {
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: recipientPhone,
-      type: 'interactive',
-      interactive: {
-        type: 'button',
-        header: headerText ? { type: 'text', text: headerText } : undefined,
-        body: { text: bodyText },
-        footer: footerText ? { text: footerText } : undefined,
-        action: {
-          buttons: buttons.map((b) => ({
-            type: 'reply',
-            reply: { id: b.id, title: b.title.substring(0, 20) },
-          })),
-        },
-      },
-    };
-    const res = await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-    return await res.json();
-  } catch (error) {
-    console.error(`❌ Error in sendInteractiveButtons:`, error.message);
-  }
-}
-
-async function sendWhatsAppImage(recipientPhone, imageUrl, caption) {
-  try {
-    const payload = {
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: recipientPhone,
-      type: 'image',
-      image: { link: imageUrl, caption: caption },
-    };
-    const res = await fetch(`https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-    return await res.json();
-  } catch (error) {
-    console.error(`❌ Error in sendWhatsAppImage:`, error.message);
-  }
-}
-
-// ============================================================================
-// PASS GENERATION & 24H CREDENTIAL REGISTRATION
+// PASS GENERATION & NOTIFICATIONS
 // ============================================================================
 async function generateTurnstilePass(visitorPhone, visitorData) {
   const zoneTag = visitorData.zone === 'RETAIL_PARKING' ? 'ZONE_RETAIL_PARKING' : 'ZONE_FULL_RESIDENTIAL';
@@ -379,7 +467,8 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
       `• *Pass Code:* ${passToken}\n` +
       `• ${zoneText}\n` +
       `• *Validity:* 24 Hours (Multiple Ingress Allowed)\n\n` +
-      `_Scan at turnstile readers. You may enter and exit freely during your visit._`
+      `_Scan at turnstile readers. You may enter and exit freely during your visit._`,
+    PHONE_ID_MAIN
   );
 
   if (visitorData.hostPhone) {
@@ -392,14 +481,12 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
         { id: `LOBBY_MEET_${visitorPhone}`, title: "I'll Meet in Lobby" },
         { id: `DISPATCH_ESCORT_${visitorPhone}`, title: "Request Runner" }
       ],
-      'Promo: R35.00 per runner escort (Standard R50.00)'
+      'Promo: R35.00 per runner escort',
+      PHONE_ID_MAIN
     );
   }
 }
 
-// ============================================================================
-// SECURITY / RECEPTION DIVERT ENGINE
-// ============================================================================
 async function triggerSecurityDivert(visitorPhone, visitorData, failReason, mediaId = null) {
   const alertId = `ALT-${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -422,8 +509,9 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason, medi
     `⚠️ *Verification Clearance Notice*\n\n` +
       `Hello ${visitorData.visitorName}, document check required.\n\n` +
       `*Status:* ${failReason}\n\n` +
-      `🏢 Show this voucher at the *Ponte Reception / Security Desk* upon arrival to receive your turnstile pass:\n\n` +
-      `• *Reference Voucher:* *[${alertId}]*`
+      `🏢 Show this voucher at the *Ponte Reception / Security Desk* upon arrival to receive your pass:\n\n` +
+      `• *Reference Voucher:* *[${alertId}]*`,
+    PHONE_ID_MAIN
   );
 
   const alertPayload =
@@ -434,15 +522,12 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason, medi
     `• *Action:* Check physical doc on HUD & issue pass.`;
 
   if (isReceptionOpen()) {
-    await sendWhatsAppMessage(RECEPTION_WA_GROUP, alertPayload);
+    await sendWhatsAppMessage(RECEPTION_WA_GROUP, alertPayload, PHONE_ID_MAIN);
   } else {
-    await sendWhatsAppMessage(SECURITY_DUTY_PHONE, alertPayload);
+    await sendWhatsAppMessage(SECURITY_DUTY_PHONE, alertPayload, PHONE_ID_MAIN);
   }
 }
 
-// ============================================================================
-// DISPATCH BROADCAST ENGINE
-// ============================================================================
 async function broadcastRunnerJob(job) {
   const runnerAlertText =
     `🏃 *NEW PONTE RUNNER TASK [#${job.jobId}]*\n\n` +
@@ -460,41 +545,69 @@ async function broadcastRunnerJob(job) {
         [
           { id: `JOB_ACCEPT_${job.jobId}`, title: 'Accept Task 🚀' },
           { id: `JOB_DECLINE_${job.jobId}`, title: 'Decline' }
-        ]
+        ],
+        '',
+        PHONE_ID_MAIN
       );
     }
   }
 }
 
 // ============================================================================
-// PAYSTACK WEBHOOK (Payment Confirmed -> Instant Dispatch)
+// PAYSTACK WEBHOOK
 // ============================================================================
 app.post('/paystack/webhook', async (req, res) => {
   res.sendStatus(200);
 
   try {
     const event = req.body;
-    if (event.event === 'charge.success') {
-      const jobId = event.data.metadata?.jobId;
-      console.log(`💳 [PAYSTACK SUCCESS] Confirmed payment for Job #${jobId}`);
+    const eventType = event.event;
+    const eventData = event.data;
+    const jobId = eventData?.metadata?.jobId;
 
-      const job = runnerJobs.get(jobId);
-      if (job && job.status === 'PENDING_PAYMENT') {
+    if (!jobId) return;
+    const job = runnerJobs.get(jobId);
+    if (!job) return;
+
+    if (eventType === 'charge.success') {
+      if (job.status === 'PENDING_PAYMENT') {
         job.status = 'PAID_AWAITING_CLAIM';
         job.paidAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
 
         const hasPin = /\b\d{4,6}\b/.test(job.details);
         const pinReminder = hasPin 
           ? '' 
-          : `\n\n⚠️ *REMINDER:* If your courier requires a release PIN/OTP (e.g., Takealot, Checkers Sixty60), please text it to your runner directly once claimed.`;
+          : `\n\n⚠️ *REMINDER:* If your courier requires a release PIN/OTP, text it to your runner once claimed.`;
 
         await sendWhatsAppMessage(
           job.hostPhone,
           `✅ *Payment Confirmed (R35.00)*\n\n` +
-            `Task *#${job.jobId}* is funded and dispatched to the active runner roster.${pinReminder}`
+            `Task *#${job.jobId}* is funded and dispatched to the active runner roster.${pinReminder}`,
+          PHONE_ID_MAIN
         );
 
         await broadcastRunnerJob(job);
+      }
+      return;
+    }
+
+    if (eventType === 'charge.failed' || eventType === 'invoice.payment_failed') {
+      const gatewayResponse = eventData.gateway_response || 'Declined';
+      if (job.status === 'PENDING_PAYMENT') {
+        await sendInteractiveButtons(
+          job.hostPhone,
+          'PAYMENT NOT COMPLETED',
+          `❌ Payment for Task *#${job.jobId}* could not be processed.\n\n` +
+          `• *Reason:* ${gatewayResponse}\n` +
+          `• *Amount:* R35.00\n\n` +
+          `You can retry payment or cancel the errand request:`,
+          [
+            { id: `RETRY_PAY_${job.jobId}`, title: 'Retry Payment 💳' },
+            { id: `CANCEL_TASK_${job.jobId}`, title: 'Cancel Task 🚫' }
+          ],
+          '',
+          PHONE_ID_MAIN
+        );
       }
     }
   } catch (err) {
@@ -503,7 +616,7 @@ app.post('/paystack/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// TURNSTILE AUTOMATED SCAN SIMULATOR (Autonomous Ingress)
+// TURNSTILE SCAN SIMULATOR
 // ============================================================================
 app.get('/api/turnstile/scan', async (req, res) => {
   const { token } = req.query;
@@ -514,13 +627,11 @@ app.get('/api/turnstile/scan', async (req, res) => {
   const nowTime = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
   pass.entries.push(nowTime);
 
-  console.log(`⚡ [TURNSTILE ACCESS GRANTED] ${pass.visitorName} scanned ${token} at ${nowTime}`);
-
   if (pass.hostPhone) {
     await sendWhatsAppMessage(
       pass.hostPhone,
-      `🔔 *Visitor Arrival Alert*\n\n` +
-        `*${pass.visitorName}* has scanned through the ground turnstiles at ${nowTime}.`
+      `🔔 *Visitor Arrival Alert*\n\n*${pass.visitorName}* scanned through the ground turnstiles at ${nowTime}.`,
+      PHONE_ID_MAIN
     );
   }
 
@@ -528,7 +639,7 @@ app.get('/api/turnstile/scan', async (req, res) => {
 });
 
 // ============================================================================
-// AUTOMATED DAILY AUDIT & PAYMENT REPORT GENERATOR
+// AUDIT ENGINE
 // ============================================================================
 function generateAuditSummary() {
   const jobsList = Array.from(runnerJobs.values());
@@ -565,8 +676,7 @@ function generateAuditSummary() {
     totalRunnerPayouts,
     platformMargin,
     communityRebate,
-    runnerStats,
-    recentFeedback: supportFeedbackLog.slice(-5)
+    runnerStats
   };
 }
 
@@ -577,16 +687,7 @@ async function sendDailyAuditReport() {
   for (const [name, stats] of Object.entries(report.runnerStats)) {
     runnerBreakdownText += `  • *${name}:* ${stats.runs} run(s) -> R${stats.earnings.toFixed(2)}\n`;
   }
-
-  if (!runnerBreakdownText) {
-    runnerBreakdownText = `  • _No verified runs completed today._\n`;
-  }
-
-  let feedbackText = '';
-  if (report.recentFeedback.length > 0) {
-    feedbackText = `\n💬 *Recent Suggestions / Hotline Calls:*\n` +
-      report.recentFeedback.map(f => `  • [${f.senderPhone}]: "${f.text}"`).join('\n') + `\n`;
-  }
+  if (!runnerBreakdownText) runnerBreakdownText = `  • _No verified runs completed today._\n`;
 
   const message =
     `📊 *PONTE CONCIERGE DAILY AUDIT REPORT*\n` +
@@ -599,15 +700,13 @@ async function sendDailyAuditReport() {
     `• *Runner Payouts Owed (R25/task):* R${report.totalRunnerPayouts.toFixed(2)}\n` +
     `• *Platform Margin (R10/task):* R${report.platformMargin.toFixed(2)}\n` +
     `• *Dlala Nje Community Fund (5%):* R${report.communityRebate.toFixed(2)}\n\n` +
-    `🏃 *Runner Shift Earnings:*\n${runnerBreakdownText}` +
-    feedbackText +
-    `\n_Generated automatically by Ponte Concierge Audit Engine._`;
+    `🏃 *Runner Shift Earnings:*\n${runnerBreakdownText}\n` +
+    `_Generated by Ponte Concierge Audit Engine._`;
 
-  console.log(`📤 Dispatching Daily Audit Report to ${ADMIN_REPORT_PHONE}...`);
-  await sendWhatsAppMessage(ADMIN_REPORT_PHONE, message);
+  await sendWhatsAppMessage(ADMIN_REPORT_PHONE, message, PHONE_ID_MAIN);
 }
 
-// Scheduled Cron Check: Runs hourly, triggers daily summary at 20:00 SAST
+// 20:00 SAST report schedule + POPIA purge
 let lastReportDate = '';
 setInterval(async () => {
   const now = new Date();
@@ -615,13 +714,11 @@ setInterval(async () => {
   const sastHours = (utcHours + 2) % 24;
   const todayStr = now.toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' });
 
-  // 1. Send Daily Report at 20:00 SAST
   if (sastHours === 20 && lastReportDate !== todayStr) {
     lastReportDate = todayStr;
     await sendDailyAuditReport();
   }
 
-  // 2. POPIA 24h+24h Sweeper
   for (const [alertId, alert] of securityAlerts.entries()) {
     if (alert.expiresAt && new Date(alert.expiresAt) <= now) {
       if (alert.mediaId) delete alert.mediaId;
@@ -637,14 +734,8 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000);
 
-// Browser Endpoint for Real-time Audit Review
-app.get('/admin/daily-report', (req, res) => {
-  const report = generateAuditSummary();
-  res.json({ status: 'SUCCESS', report });
-});
-
 // ============================================================================
-// WEBHOOK VERIFICATION (GET)
+// META WEBHOOK VERIFICATION (GET)
 // ============================================================================
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -658,7 +749,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ============================================================================
-// WEBHOOK EVENT PROCESSOR (POST)
+// INBOUND MESSAGE PROCESSOR (POST)
 // ============================================================================
 app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
@@ -673,8 +764,21 @@ app.post('/webhook', async (req, res) => {
 
     const senderPhone = message.from;
     const messageType = message.type;
+    const recipientPhoneId = value?.metadata?.phone_number_id;
 
-    // 1. BUTTON CLICKS
+    // =========================================================================
+    // CHANNEL A: 072 SUPPORT LINE -> GEMINI AI TRIAGE & BACKLOG AGENT
+    // =========================================================================
+    if (recipientPhoneId === PHONE_ID_SUPPORT) {
+      if (messageType === 'text') {
+        await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim());
+      }
+      return;
+    }
+
+    // =========================================================================
+    // CHANNEL B: 081 MAIN ENGINE -> INTERACTIVE BUTTONS, OCR, DISPATCH
+    // =========================================================================
     if (messageType === 'interactive' && message.interactive.type === 'button_reply') {
       const buttonId = message.interactive.button_reply.id;
 
@@ -683,14 +787,15 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Ponte Resident Profile Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
+          `🏠 *Ponte Resident Profile Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`,
+          PHONE_ID_MAIN
         );
         return;
       }
 
       if (buttonId === 'ROLE_RUNNER') {
         userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date(), fullName: 'Ponte Resident Runner' });
-        await sendWhatsAppMessage(senderPhone, `🏃 *Ponte Runner Roster Activated*`);
+        await sendWhatsAppMessage(senderPhone, `🏃 *Ponte Runner Roster Activated*`, PHONE_ID_MAIN);
         return;
       }
 
@@ -700,9 +805,9 @@ app.post('/webhook', async (req, res) => {
           senderPhone,
           'MEET IN LOBBY CONFIRMED',
           `Your guest has 24h turnstile access.\n\nWhen your guest is ready to leave for good, authorize departure below:`,
-          [
-            { id: `AUTH_EXIT_${guestPhone}`, title: 'Authorize Exit 🚪' }
-          ]
+          [{ id: `AUTH_EXIT_${guestPhone}`, title: 'Authorize Exit 🚪' }],
+          '',
+          PHONE_ID_MAIN
         );
         return;
       }
@@ -717,7 +822,8 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          `📝 *Escort Pickup Note:*\n\nReply with where your guest is waiting:\n*(e.g., "Lobby turnstiles" or "Main Gate Pedestrian Kiosk")*`
+          `📝 *Escort Pickup Note:*\n\nReply with where your guest is waiting:\n*(e.g., "Lobby turnstiles" or "Main Gate Pedestrian Kiosk")*`,
+          PHONE_ID_MAIN
         );
         return;
       }
@@ -733,7 +839,7 @@ app.post('/webhook', async (req, res) => {
           ? `📝 *Delivery Details & Courier PIN:*\n\nReply with what to collect, courier company, and release PIN:\n*(e.g., "Main Gate - Checkers Sixty60 under Rudi, PIN: 4812")*`
           : `📝 *Escort Details:*\n\nReply with who and where to meet:\n*(e.g., "Lobby turnstiles - Thabo 0821234567")*`;
 
-        await sendWhatsAppMessage(senderPhone, promptText);
+        await sendWhatsAppMessage(senderPhone, promptText, PHONE_ID_MAIN);
         return;
       }
 
@@ -758,25 +864,47 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          `⏳ *Pre-clearance invitation sent to ${session.visitorName}* (${formattedGuestPhone}).`
+          `⏳ *Pre-clearance invitation sent to ${session.visitorName}* (${formattedGuestPhone}).`,
+          PHONE_ID_MAIN
         );
 
         await sendWhatsAppMessage(
           formattedGuestPhone,
           `🏢 *Ponte City Access Pre-Clearance*\n\n` +
             `Hello ${session.visitorName}! Resident *${senderPhone}* has pre-cleared your arrival (${accessType}).\n\n` +
-            `To issue your 24-hour optical access pass, reply with your *13-Digit SA ID* or *Passport Number*:`
+            `To issue your 24-hour optical access pass, reply with your *13-Digit SA ID* or *Passport Number*:`,
+          PHONE_ID_MAIN
         );
         return;
       }
 
-      // Runner Claims: Collects directly from waiting courier
+      if (buttonId.startsWith('RETRY_PAY_')) {
+        const retryJobId = buttonId.replace('RETRY_PAY_', '');
+        const retryJob = runnerJobs.get(retryJobId);
+        if (retryJob) {
+          const checkoutUrl = await generatePaystackCheckout(retryJob.hostPhone, retryJob.unit, retryJob.jobId);
+          await sendWhatsAppMessage(
+            senderPhone,
+            `💳 *Retry Payment for Task [#${retryJob.jobId}]*\n\nTap below to complete your R35.00 checkout:\n${checkoutUrl}`,
+            PHONE_ID_MAIN
+          );
+        }
+        return;
+      }
+
+      if (buttonId.startsWith('CANCEL_TASK_')) {
+        const cancelJobId = buttonId.replace('CANCEL_TASK_', '');
+        runnerJobs.delete(cancelJobId);
+        await sendWhatsAppMessage(senderPhone, `🚫 *Task #${cancelJobId} Cancelled.* No fee was charged.`, PHONE_ID_MAIN);
+        return;
+      }
+
       if (buttonId.startsWith('JOB_ACCEPT_')) {
         const jobId = buttonId.replace('JOB_ACCEPT_', '');
         const job = runnerJobs.get(jobId);
 
         if (!job || job.status === 'CLAIMED' || job.status === 'IN_TRANSIT') {
-          await sendWhatsAppMessage(senderPhone, `❌ *Task already claimed* by another Ponte Runner.`);
+          await sendWhatsAppMessage(senderPhone, `❌ *Task already claimed* by another Ponte Runner.`, PHONE_ID_MAIN);
           return;
         }
 
@@ -790,19 +918,18 @@ app.post('/webhook', async (req, res) => {
           `• *Destination:* Unit ${job.unit} (${job.hostName}: ${job.hostPhone})\n` +
           `📌 *Details:* _${job.details}_\n\n` +
           `Meet courier/guest directly at the gate. Tap below once collected:`,
-          [
-            { id: `JOB_COLLECTED_${jobId}`, title: 'Collected & En Route 🏃‍♂️' }
-          ]
+          [{ id: `JOB_COLLECTED_${jobId}`, title: 'Collected & En Route 🏃‍♂️' }],
+          '',
+          PHONE_ID_MAIN
         );
         return;
       }
 
       if (buttonId.startsWith('JOB_DECLINE_')) {
-        await sendWhatsAppMessage(senderPhone, `👍 Task declined. You remain on standby.`);
+        await sendWhatsAppMessage(senderPhone, `👍 Task declined. You remain on standby.`, PHONE_ID_MAIN);
         return;
       }
 
-      // Step 1: Runner collects from courier/guest -> alerts resident
       if (buttonId.startsWith('JOB_COLLECTED_')) {
         const jobId = buttonId.replace('JOB_COLLECTED_', '');
         const job = runnerJobs.get(jobId);
@@ -814,21 +941,21 @@ app.post('/webhook', async (req, res) => {
         await sendWhatsAppMessage(
           job.hostPhone,
           `🏃‍♂️ *Runner En Route to Your Unit!*\n\n` +
-            `Ponte Runner (${senderPhone}) has met the courier/guest and is heading up to *Unit ${job.unit}*.`
+            `Ponte Runner (${senderPhone}) has collected the parcel/guest and is heading to *Unit ${job.unit}*.`,
+          PHONE_ID_MAIN
         );
 
         await sendInteractiveButtons(
           senderPhone,
           `TASK #${jobId} IN TRANSIT`,
           `Proceeding to Unit ${job.unit}.\n\nTap below once you reach the resident's door:`,
-          [
-            { id: `JOB_DELIVERED_${jobId}`, title: 'Delivered to Unit ✅' }
-          ]
+          [{ id: `JOB_DELIVERED_${jobId}`, title: 'Delivered to Unit ✅' }],
+          '',
+          PHONE_ID_MAIN
         );
         return;
       }
 
-      // Step 2: Runner marks delivered at unit door
       if (buttonId.startsWith('JOB_DELIVERED_')) {
         const jobId = buttonId.replace('JOB_DELIVERED_', '');
         const job = runnerJobs.get(jobId);
@@ -840,7 +967,8 @@ app.post('/webhook', async (req, res) => {
         await sendWhatsAppMessage(
           senderPhone,
           `⏳ *Delivery Reported for Task #${jobId}*\n\n` +
-            `Waiting for resident (${job.hostName}, Unit ${job.unit}) to confirm physical handover before releasing payout.`
+            `Waiting for resident (${job.hostName}, Unit ${job.unit}) to confirm physical handover before releasing payout.`,
+          PHONE_ID_MAIN
         );
 
         await sendInteractiveButtons(
@@ -851,12 +979,13 @@ app.post('/webhook', async (req, res) => {
           [
             { id: `RESIDENT_CONFIRM_${jobId}`, title: 'Confirm Receipt 👍' },
             { id: `RESIDENT_DISPUTE_${jobId}`, title: 'Not Received ⚠️' }
-          ]
+          ],
+          '',
+          PHONE_ID_MAIN
         );
         return;
       }
 
-      // Step 3: Resident confirms receipt -> unlocks runner payout
       if (buttonId.startsWith('RESIDENT_CONFIRM_')) {
         const jobId = buttonId.replace('RESIDENT_CONFIRM_', '');
         const job = runnerJobs.get(jobId);
@@ -869,7 +998,8 @@ app.post('/webhook', async (req, res) => {
           await sendWhatsAppMessage(
             job.claimedBy,
             `🎉 *Task #${jobId} Verified by Resident!*\n\n` +
-              `Unit ${job.unit} confirmed safe handover. *R25.00* has been credited to your active shift balance.`
+              `Unit ${job.unit} confirmed safe handover. *R25.00* has been credited to your active shift balance.`,
+            PHONE_ID_MAIN
           );
         }
 
@@ -878,23 +1008,22 @@ app.post('/webhook', async (req, res) => {
             senderPhone,
             'HANDOVER COMPLETED',
             `✅ Task #${jobId} closed.\n\nWhen your guest is ready to leave later, authorize departure below:`,
-            [
-              { id: `AUTH_EXIT_${job.guestPhone}`, title: 'Authorize Exit 🚪' }
-            ]
+            [{ id: `AUTH_EXIT_${job.guestPhone}`, title: 'Authorize Exit 🚪' }],
+            '',
+            PHONE_ID_MAIN
           );
         } else {
-          await sendWhatsAppMessage(senderPhone, `✅ *Task #${jobId} Closed & Verified.*`);
+          await sendWhatsAppMessage(senderPhone, `✅ *Task #${jobId} Closed & Verified.*`, PHONE_ID_MAIN);
         }
         return;
       }
 
       if (buttonId.startsWith('RESIDENT_DISPUTE_')) {
         const jobId = buttonId.replace('RESIDENT_DISPUTE_', '');
-        await sendWhatsAppMessage(senderPhone, `⚠️ Handover dispute logged. Building security alerted.`);
+        await sendWhatsAppMessage(senderPhone, `⚠️ Handover dispute logged. Building security alerted.`, PHONE_ID_MAIN);
         return;
       }
 
-      // Exit Authorization (Only Resident Can Authorize)
       if (buttonId.startsWith('AUTH_EXIT_')) {
         const guestPhone = buttonId.replace('AUTH_EXIT_', '');
         const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'Resident' };
@@ -915,25 +1044,25 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          `🚪 *Exit Clearance Authorized*\n\n` +
-            `Security HUD alerted. Your guest can now proceed through the exit gate.`
+          `🚪 *Exit Clearance Authorized*\n\nSecurity HUD alerted. Your guest can now proceed through the exit gate.`,
+          PHONE_ID_MAIN
         );
 
         await sendWhatsAppMessage(
           guestPhone,
-          `👋 *Departure Authorized*\n\n` +
-            `Your host has authorized your exit. Thank you for visiting Ponte City!`
+          `👋 *Departure Authorized*\n\nYour host has authorized your exit. Thank you for visiting Ponte City!`,
+          PHONE_ID_MAIN
         );
         return;
       }
     }
 
-    // 2. IMAGE UPLOAD HANDLER
+    // IMAGE UPLOADS
     if (messageType === 'image') {
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
         const imageId = message.image.id;
-        await sendWhatsAppMessage(senderPhone, '🔎 *Analyzing Document Image...*');
+        await sendWhatsAppMessage(senderPhone, '🔎 *Analyzing Document Image...*', PHONE_ID_MAIN);
 
         const imageBuffer = await downloadMetaImage(imageId);
         if (!imageBuffer) {
@@ -954,59 +1083,17 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // 3. TEXT MESSAGE INGRESS & ROUTING
+    // TEXT MESSAGES ON 081
     if (messageType === 'text') {
       const rawText = message.text.body.trim();
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
-      // On-demand Admin Daily Report command
       if (cleanText === 'report' && senderPhone === ADMIN_REPORT_PHONE) {
         await sendDailyAuditReport();
         return;
       }
 
-      // Support & Suggestions Hotline Flow
-      if (cleanText.startsWith('suggest') || cleanText.startsWith('support') || cleanText.startsWith('help')) {
-        const suggestionText = rawText.replace(/^(suggest|support|help)[\s:]*/i, '').trim();
-        if (suggestionText) {
-          supportFeedbackLog.push({
-            timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
-            senderPhone,
-            text: suggestionText
-          });
-          await sendWhatsAppMessage(
-            senderPhone,
-            `🙏 *Thank You for Your Feedback!*\n\nYour suggestion has been logged with Ponte Concierge operations:\n_"${suggestionText}"_`
-          );
-          // Ping admin directly
-          await sendWhatsAppMessage(
-            ADMIN_REPORT_PHONE,
-            `💡 *NEW CONCIERGE HOTLINE MESSAGE*\nFrom: ${senderPhone}\nMessage: "${suggestionText}"`
-          );
-          return;
-        } else {
-          await sendWhatsAppMessage(
-            senderPhone,
-            `💡 *Ponte Support & Hotline*\n\nTo submit a suggestion, report an issue, or ask a question, reply starting with *suggest* or *help* followed by your message.\n\n*Example:* suggest Could runners also help with key handovers?`
-          );
-          return;
-        }
-      }
-
-      if (cleanText === 'exit' || cleanText === 'checkout' || cleanText === 'leave') {
-        const isVisitor = visitorSessions.has(senderPhone);
-        if (isVisitor) {
-          await sendWhatsAppMessage(
-            senderPhone,
-            `🚫 *Security Policy Notice*\n\n` +
-              `Visitors cannot self-authorize exit. Your host resident must authorize departure.`
-          );
-          return;
-        }
-      }
-
-      // Resident Submits Runner Note -> Generates R35 Paystack Link
       const activeResSession = residentSessions.get(senderPhone);
       if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_NOTE') {
         const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'RC Janse van Rensburg' };
@@ -1037,46 +1124,28 @@ app.post('/webhook', async (req, res) => {
             `• *Pickup Note:* _"${rawText}"_\n` +
             `• *Amount Due:* *R35.00* (Launch Promo)\n\n` +
             `👉 *Tap Link to Complete Payment:*\n${checkoutUrl}\n\n` +
-            `_Once paid, task broadcasts instantly to active runners._`
+            `_Once paid, task broadcasts instantly to active runners._`,
+          PHONE_ID_MAIN
         );
         return;
       }
 
-      if (cleanText === '1') {
-        userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
-        residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
-        await sendWhatsAppMessage(
-          senderPhone,
-          `🏠 *Ponte Resident Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`
-        );
-        return;
-      }
-
-      if (cleanText === '2') {
-        userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date(), fullName: 'Ponte Resident Runner' });
-        await sendWhatsAppMessage(senderPhone, `🏃 *Ponte Runner Roster Activated*`);
-        return;
-      }
-
-      if (
-        cleanText === 'register' ||
-        cleanText === 'start' ||
-        cleanText === 'hi' ||
-        cleanText === 'hello'
-      ) {
+      if (cleanText === 'register' || cleanText === 'start' || cleanText === 'hi' || cleanText === 'hello') {
         const existing = userProfiles.get(senderPhone);
         if (existing) {
           if (existing.role === 'RESIDENT') {
             await sendWhatsAppMessage(
               senderPhone,
-              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass\n• Reply *help* for hotline/suggestions`
+              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass`,
+              PHONE_ID_MAIN
             );
             return;
           }
           if (existing.role === 'RUNNER') {
             await sendWhatsAppMessage(
               senderPhone,
-              `🏃 *Welcome back ${existing.fullName}!* (Ponte Runner)\n\nYou are on active standby for dispatches.\n• Reply *help* to contact admin.`
+              `🏃 *Welcome back ${existing.fullName}!* (Ponte Runner)\nYou are on active standby for dispatches.`,
+              PHONE_ID_MAIN
             );
             return;
           }
@@ -1090,7 +1159,8 @@ app.post('/webhook', async (req, res) => {
             { id: 'ROLE_RESIDENT', title: 'Ponte Resident' },
             { id: 'ROLE_RUNNER', title: 'Ponte Runner' }
           ],
-          'Visitors: Passes are issued by your host.'
+          'Visitors: Passes are issued by your host.',
+          PHONE_ID_MAIN
         );
         return;
       }
@@ -1104,7 +1174,8 @@ app.post('/webhook', async (req, res) => {
             { id: 'REQ_RUNNER_PARCEL', title: 'Collect Delivery 🛒' },
             { id: 'REQ_RUNNER_ESCORT', title: 'Escort a Visitor 👥' }
           ],
-          'Promo Rate: R35.00 per service (Regular R50)'
+          'Promo Rate: R35.00 per service',
+          PHONE_ID_MAIN
         );
         return;
       }
@@ -1113,7 +1184,8 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
         await sendWhatsAppMessage(
           senderPhone,
-          `👥 *Ponte Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`
+          `👥 *Ponte Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`,
+          PHONE_ID_MAIN
         );
         return;
       }
@@ -1122,17 +1194,17 @@ app.post('/webhook', async (req, res) => {
         residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'RETAIL_PARKING' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🅿️ *Retail / Parking Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Lerato Khumalo, 0831112233`
+          `🅿️ *Retail / Parking Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Lerato Khumalo, 0831112233`,
+          PHONE_ID_MAIN
         );
         return;
       }
 
-      // Parse Guest Details
       const resSession = residentSessions.get(senderPhone);
       if (resSession && resSession.step === 'AWAITING_GUEST_DETAILS') {
         const parts = rawText.split(',');
         if (parts.length < 2) {
-          await sendWhatsAppMessage(senderPhone, '⚠️ Please separate *Name* and *Cell Number* with a comma.');
+          await sendWhatsAppMessage(senderPhone, '⚠️ Please separate *Name* and *Cell Number* with a comma.', PHONE_ID_MAIN);
           return;
         }
 
@@ -1151,12 +1223,13 @@ app.post('/webhook', async (req, res) => {
             { id: 'ACCESS_TYPE_PEDESTRIAN', title: 'Pedestrian' },
             { id: 'ACCESS_TYPE_VEHICLE', title: 'Resident Parking' },
             { id: 'ACCESS_TYPE_EHAILING', title: 'Uber / Bolt' },
-          ]
+          ],
+          '',
+          PHONE_ID_MAIN
         );
         return;
       }
 
-      // Parse ID / Passport
       const visSession = visitorSessions.get(senderPhone);
       if (visSession && visSession.step === 'AWAITING_ID_NUMBER') {
         const sanitizedId = cleanText.replace(/[\s\-\.]/g, '');
@@ -1169,7 +1242,8 @@ app.post('/webhook', async (req, res) => {
           visSession.step = 'AWAITING_DOC_IMAGE';
           await sendWhatsAppMessage(
             senderPhone,
-            `✅ *Passport Number Recorded (${maskID(sanitizedId)})*\n\nPlease upload a clear photo of your *Passport Identity Page*:`
+            `✅ *Passport Number Recorded (${maskID(sanitizedId)})*\n\nPlease upload a clear photo of your *Passport Identity Page*:`,
+            PHONE_ID_MAIN
           );
           return;
         }
@@ -1178,7 +1252,8 @@ app.post('/webhook', async (req, res) => {
           if (!validateSouthAfricanID(sanitizedId) && !sanitizedId.startsWith('999')) {
             await sendWhatsAppMessage(
               senderPhone,
-              `❌ *Invalid South African ID Number*\n\nChecksum failed. Please check your number and re-enter:`
+              `❌ *Invalid South African ID Number*\n\nChecksum failed. Please re-enter:`,
+              PHONE_ID_MAIN
             );
             return;
           }
@@ -1188,19 +1263,25 @@ app.post('/webhook', async (req, res) => {
           visSession.step = 'AWAITING_DOC_IMAGE';
           await sendWhatsAppMessage(
             senderPhone,
-            `✅ *ID Checksum Validated (${maskID(sanitizedId)})*\n\nPlease upload a photo of your *Smart ID, Green Book, or Driver's License*:`
+            `✅ *ID Checksum Validated (${maskID(sanitizedId)})*\n\nPlease upload a photo of your *Smart ID, Green Book, or Driver's License*:`,
+            PHONE_ID_MAIN
           );
           return;
         }
 
         await sendWhatsAppMessage(
           senderPhone,
-          `⚠️ Enter your *13-Digit SA ID* or *Passport Number* (e.g. A10436243):`
+          `⚠️ Enter your *13-Digit SA ID* or *Passport Number* (e.g. A10436243):`,
+          PHONE_ID_MAIN
         );
         return;
       }
 
-      await sendWhatsAppMessage(senderPhone, `👋 *Ponte Concierge*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *help* for hotline/suggestions`);
+      await sendWhatsAppMessage(
+        senderPhone,
+        `👋 *Ponte Concierge*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• For support, message +27 72 949 4561`,
+        PHONE_ID_MAIN
+      );
     }
   } catch (error) {
     console.error('❌ Webhook error:', error);
@@ -1208,7 +1289,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// GUARD NOTEPAD HUD & OVERRIDE API (Inspection Diverts & Exit Log Only)
+// GUARD LIVE HUD & OVERRIDE API
 // ============================================================================
 app.get('/security/live', (req, res) => {
   const alertsList = Array.from(securityAlerts.values()).reverse();
@@ -1223,7 +1304,7 @@ app.get('/security/live', (req, res) => {
       </td>
       <td style="padding: 12px; color: ${a.zone === 'EGRESS_CLEARANCE' ? '#eab308' : '#f87171'};">
         ${a.reason}<br>
-        ${a.mediaId ? `<span style="font-size: 11px; color: #38bdf8;">📷 Document attached (Audit Escrow)</span>` : ''}
+        ${a.mediaId ? `<span style="font-size: 11px; color: #38bdf8;">📷 Document attached</span>` : ''}
       </td>
       <td style="padding: 12px;"><span style="background: ${a.zone === 'RETAIL_PARKING' ? '#eab308' : (a.zone === 'EGRESS_CLEARANCE' ? '#f97316' : '#22c55e')}; color: #000; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">${a.zone}</span></td>
       <td style="padding: 12px;">
@@ -1243,7 +1324,7 @@ app.get('/security/live', (req, res) => {
     <!DOCTYPE html>
     <html>
       <head>
-        <title>Ponte City - Security Notepad</title>
+        <title>Ponte City - Security HUD</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
           body { font-family: sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
@@ -1261,12 +1342,8 @@ app.get('/security/live', (req, res) => {
           <div>● Live Feed</div>
         </div>
         <table>
-          <thead>
-            <tr><th>Alert Ref</th><th>Time</th><th>Visitor Details</th><th>Status / Reason</th><th>Zone</th><th>Action</th></tr>
-          </thead>
-          <tbody>
-            ${rows || '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #64748b;">No active verification alerts or pending exits.</td></tr>'}
-          </tbody>
+          <thead><tr><th>Alert Ref</th><th>Time</th><th>Visitor Details</th><th>Status / Reason</th><th>Zone</th><th>Action</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #64748b;">No active verification alerts.</td></tr>'}</tbody>
         </table>
         <div style="background: #1e293b; padding: 20px; border-radius: 8px; margin-top: 30px;">
           <h3 style="margin-top: 0; color: #38bdf8;">🛠️ Guard Assisted Check-In</h3>
@@ -1293,8 +1370,6 @@ app.get('/security/override', async (req, res) => {
 
   if (action === 'APPROVE') {
     alert.status = 'APPROVED';
-    alert.expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
-
     await generateTurnstilePass(alert.visitorPhone, {
       visitorName: alert.visitorName,
       idNumber: alert.idNumber || 'PHYSICAL_CHECK_PASSED',
@@ -1302,22 +1377,13 @@ app.get('/security/override', async (req, res) => {
       zone: alert.zone,
       hostPhone: alert.hostPhone
     });
-    await sendWhatsAppMessage(alert.visitorPhone, `🛡️ *Document Verified & Clearance Granted*\nYour turnstile pass is displayed above.`);
+    await sendWhatsAppMessage(alert.visitorPhone, `🛡️ *Document Verified & Clearance Granted*\nYour turnstile pass has been issued.`, PHONE_ID_MAIN);
   } else if (action === 'CONFIRM_EXIT') {
     alert.status = 'EXIT_CONFIRMED';
-    await sendWhatsAppMessage(
-      alert.visitorPhone,
-      `🚪 *Exit Logged*\n\nTurnstile exit confirmed by security guard at ${new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' })}. Safe travels!`
-    );
-    if (alert.hostPhone && alert.hostPhone !== 'Walk-in') {
-      await sendWhatsAppMessage(
-        alert.hostPhone,
-        `👋 *Guest Departure Completed*\n\n${alert.visitorName} has signed out through the gate.`
-      );
-    }
+    await sendWhatsAppMessage(alert.visitorPhone, `🚪 *Exit Logged*\nSafe travels!`, PHONE_ID_MAIN);
   } else {
     alert.status = 'REJECTED';
-    await sendWhatsAppMessage(alert.visitorPhone, `🚫 *Entry Denied by Security Command*`);
+    await sendWhatsAppMessage(alert.visitorPhone, `🚫 *Entry Denied by Security Command*`, PHONE_ID_MAIN);
   }
   res.redirect('/security/live');
 });
@@ -1337,10 +1403,82 @@ app.post('/security/assisted-clear', async (req, res) => {
   res.redirect('/security/live');
 });
 
+// ============================================================================
+// PRODUCT BACKLOG APPROVAL HUD
+// ============================================================================
+app.get('/admin/backlog', (req, res) => {
+  const { action, id } = req.query;
+
+  if (action && id) {
+    const item = customerBacklogQueue.find(s => s.id === id);
+    if (item) {
+      if (action === 'APPROVE') item.status = 'APPROVED_FOR_DEV';
+      if (action === 'REJECT') item.status = 'REJECTED';
+    }
+    return res.redirect('/admin/backlog');
+  }
+
+  const rows = customerBacklogQueue.slice().reverse().map(item => `
+    <tr style="border-bottom: 1px solid #334155; ${item.status !== 'PENDING_APPROVAL' ? 'opacity: 0.6;' : ''}">
+      <td style="padding: 12px; font-weight: bold; color: #38bdf8;">${item.id}</td>
+      <td style="padding: 12px; font-size: 13px;">${item.submittedDate} ${item.submittedAt}</td>
+      <td style="padding: 12px; font-size: 13px; color: #cbd5e1;">"${item.rawFeedback}"</td>
+      <td style="padding: 12px; font-weight: 500;">${item.userStory}</td>
+      <td style="padding: 12px;">
+        <span style="background: ${item.businessValue === 'High' ? '#22c55e' : (item.businessValue === 'Medium' ? '#eab308' : '#64748b')}; color: black; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;">
+          ${item.businessValue}
+        </span>
+      </td>
+      <td style="padding: 12px;">
+        <span style="color: ${item.status === 'APPROVED_FOR_DEV' ? '#4ade80' : (item.status === 'REJECTED' ? '#ef4444' : '#facc15')}; font-weight: bold; font-size: 12px;">
+          ${item.status}
+        </span>
+      </td>
+      <td style="padding: 12px;">
+        ${item.status === 'PENDING_APPROVAL' ? `
+          <a href="/admin/backlog?action=APPROVE&id=${item.id}" style="background: #22c55e; color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; margin-right: 5px;">Approve ✅</a>
+          <a href="/admin/backlog?action=REJECT&id=${item.id}" style="background: #ef4444; color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold;">Reject ❌</a>
+        ` : `—`}
+      </td>
+    </tr>
+  `).join('');
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Ponte Concierge - Customer Feature Backlog</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+          .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #1e293b; padding-bottom: 15px; margin-bottom: 20px; }
+          table { width: 100%; border-collapse: collapse; text-align: left; }
+          th { background: #1e293b; padding: 12px; color: #94a3b8; font-size: 13px; }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h2 style="margin: 0; color: #38bdf8;">📋 Customer Feature Backlog (Gemini Extracted)</h2>
+          <div style="font-size: 13px; color: #94a3b8;">Review & Approve for Steering Sessions</div>
+        </div>
+        <table>
+          <thead><tr><th>Ref</th><th>Time</th><th>Resident Feedback</th><th>Generated User Story</th><th>Value</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="7" style="padding: 20px; text-align: center; color: #64748b;">No feature requests logged yet.</td></tr>'}</tbody>
+        </table>
+      </body>
+    </html>
+  `);
+});
+
+app.get('/admin/daily-report', (req, res) => {
+  const report = generateAuditSummary();
+  res.json({ status: 'SUCCESS', report });
+});
+
 app.get('/', (req, res) => {
-  res.json({ service: 'Ponte Concierge Live Pilot Engine', status: 'ONLINE', time: new Date().toISOString() });
+  res.json({ service: 'Ponte Concierge Multi-Channel Pilot Engine', status: 'ONLINE', time: new Date().toISOString() });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Ponte Concierge running on http://0.0.0.0:${PORT}`);
+  console.log(`🚀 Ponte Concierge running on port ${PORT}`);
 });
