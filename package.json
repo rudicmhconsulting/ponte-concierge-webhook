@@ -7,7 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@google/genai": "^0.1.1",
+    "@google/genai": "latest",
     "express": "^4.19.2",
     "sharp": "^0.33.2",
     "tesseract.js": "^5.0.4"
