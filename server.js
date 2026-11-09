@@ -32,9 +32,8 @@ const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 // ============================================================================
 // GEMINI CLIENT SETUP (Using v1beta for Flash model access)
 // ============================================================================
-const ai = new GoogleGenAI({ 
-  apiKey: process.env.GEMINI_API_KEY,
-  apiVersion: 'v1beta'
+// Remove apiVersion parameter so the SDK uses its native routing
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 });
 
 // ============================================================================
@@ -168,8 +167,8 @@ Instructions:
    - Set status to "PENDING_APPROVAL".
 `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-1.5-flash',
+   const response = await ai.models.generateContent({
+      model: 'gemini-2.0-flash',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
