@@ -30,11 +30,9 @@ const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG';
 const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 
 // ============================================================================
-// GEMINI CLIENT SETUP (Using v1beta for Flash model access)
+// GEMINI CLIENT SETUP (Native Routing - Uses gemini-2.0-flash)
 // ============================================================================
-// Remove apiVersion parameter so the SDK uses its native routing
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-});
 
 // ============================================================================
 // IN-MEMORY STORES & QUEUES
@@ -140,7 +138,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneI
 }
 
 // ============================================================================
-// GEMINI SUPPORT & USER STORY GENERATOR
+// GEMINI SUPPORT & USER STORY GENERATOR (Using gemini-2.0-flash)
 // ============================================================================
 async function handleSupportAndBacklogAgent(senderPhone, userMessage) {
   try {
@@ -167,7 +165,7 @@ Instructions:
    - Set status to "PENDING_APPROVAL".
 `;
 
-   const response = await ai.models.generateContent({
+    const response = await ai.models.generateContent({
       model: 'gemini-2.0-flash',
       contents: prompt,
       config: {
