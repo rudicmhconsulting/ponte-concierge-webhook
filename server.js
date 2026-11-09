@@ -14,8 +14,8 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 // ============================================================================
 // DUAL-LINE WABA IDENTIFIERS (Ponte Concierges WABA 1799638264570073)
 // ============================================================================
-const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)
-const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448931934515007'; // 072 949 4561 (AI Support & Feedback)
+const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)[cite: 7]
+const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448931934515007'; // 072 949 4561 (AI Support & Feedback)[cite: 7]
 
 // Operational Hotline & Admin Phones
 const ADMIN_REPORT_PHONE = '27715720458';
@@ -30,9 +30,12 @@ const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG';
 const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 
 // ============================================================================
-// GEMINI CLIENT SETUP
+// GEMINI CLIENT SETUP (Using v1beta for Flash model access)
 // ============================================================================
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenAI({ 
+  apiKey: process.env.GEMINI_API_KEY,
+  apiVersion: 'v1beta'
+});
 
 // ============================================================================
 // IN-MEMORY STORES & QUEUES
