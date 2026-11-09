@@ -14,8 +14,8 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 // ============================================================================
 // DUAL-LINE WABA IDENTIFIERS (Ponte Concierges WABA 1799638264570073)
 // ============================================================================
-const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)[cite: 7]
-const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448931934515007'; // 072 949 4561 (AI Support & Feedback)[cite: 7]
+const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)
+const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448931934515007'; // 072 949 4561 (AI Support & Feedback)
 
 // Operational Hotline & Admin Phones
 const ADMIN_REPORT_PHONE = '27715720458';
@@ -30,7 +30,7 @@ const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG';
 const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 
 // ============================================================================
-// GEMINI CLIENT SETUP (Native Routing - Uses gemini-2.0-flash)
+// GEMINI CLIENT SETUP (gemini-3.8-flash for support triage & user stories)
 // ============================================================================
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -55,7 +55,7 @@ userProfiles.set('27688814679', { role: 'RUNNER', registeredAt: new Date(), full
 userProfiles.set('27656206712', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Faith' });
 
 // ============================================================================
-// OUTBOUND META GRAPH API HELPERS
+// OUTBOUND META GRAPH API HELPERS (With Verbose Error Tracing)
 // ============================================================================
 async function sendWhatsAppMessage(recipientPhone, messageText, senderPhoneId = PHONE_ID_MAIN) {
   try {
@@ -74,9 +74,15 @@ async function sendWhatsAppMessage(recipientPhone, messageText, senderPhoneId = 
       },
       body: JSON.stringify(payload),
     });
-    return await res.json();
+    const result = await res.json();
+    if (!res.ok || result.error) {
+      console.error(`❌ Meta Outbound Send Error from ${senderPhoneId} to ${recipientPhone}:`, JSON.stringify(result));
+    } else {
+      console.log(`✅ Message delivered via ${senderPhoneId} to ${recipientPhone} (ID: ${result.messages?.[0]?.id})`);
+    }
+    return result;
   } catch (error) {
-    console.error('❌ Error in sendWhatsAppMessage:', error.message);
+    console.error(`❌ Network Error in sendWhatsAppMessage:`, error.message);
   }
 }
 
@@ -108,9 +114,13 @@ async function sendInteractiveButtons(recipientPhone, headerText, bodyText, butt
       },
       body: JSON.stringify(payload),
     });
-    return await res.json();
+    const result = await res.json();
+    if (!res.ok || result.error) {
+      console.error(`❌ Meta Outbound Buttons Error from ${senderPhoneId} to ${recipientPhone}:`, JSON.stringify(result));
+    }
+    return result;
   } catch (error) {
-    console.error('❌ Error in sendInteractiveButtons:', error.message);
+    console.error(`❌ Error in sendInteractiveButtons:`, error.message);
   }
 }
 
@@ -131,14 +141,18 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneI
       },
       body: JSON.stringify(payload),
     });
-    return await res.json();
+    const result = await res.json();
+    if (!res.ok || result.error) {
+      console.error(`❌ Meta Outbound Image Error from ${senderPhoneId} to ${recipientPhone}:`, JSON.stringify(result));
+    }
+    return result;
   } catch (error) {
-    console.error('❌ Error in sendWhatsAppImage:', error.message);
+    console.error(`❌ Error in sendWhatsAppImage:`, error.message);
   }
 }
 
 // ============================================================================
-// GEMINI SUPPORT & USER STORY GENERATOR (Using gemini-2.0-flash)
+// GEMINI SUPPORT & USER STORY GENERATOR
 // ============================================================================
 async function handleSupportAndBacklogAgent(senderPhone, userMessage) {
   try {
@@ -184,8 +198,9 @@ Instructions:
     });
 
     const parsed = JSON.parse(response.text.trim());
+    console.log(`🤖 [GEMINI SUCCESS] Category: ${parsed.category} | Reply: "${parsed.replyText}"`);
 
-    // Reply back to resident via the Support line (072)
+    // Reply back to user via the Support line (072)
     await sendWhatsAppMessage(senderPhone, parsed.replyText, PHONE_ID_SUPPORT);
 
     // Staging Feature Requests
@@ -202,6 +217,7 @@ Instructions:
       };
 
       customerBacklogQueue.push(storyItem);
+      console.log(`📋 [STAGED BACKLOG] Added ${storyItem.id}: "${storyItem.userStory}"`);
 
       await sendWhatsAppMessage(
         ADMIN_REPORT_PHONE,
