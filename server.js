@@ -14,8 +14,8 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 // ============================================================================
 // DUAL-LINE WABA IDENTIFIERS (Ponte Concierges WABA 1799638264570073)
 // ============================================================================
-const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)
-const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448931934515007'; // 072 949 4561 (AI Support & Feedback)
+const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)[cite: 7]
+const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448916934975007'; // 072 949 4561 (AI Support & Feedback)[cite: 26]
 
 // Operational Hotline & Admin Phones
 const ADMIN_REPORT_PHONE = '27715720458';
@@ -55,7 +55,7 @@ userProfiles.set('27688814679', { role: 'RUNNER', registeredAt: new Date(), full
 userProfiles.set('27656206712', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Faith' });
 
 // ============================================================================
-// OUTBOUND META GRAPH API HELPERS (With Verbose Error Tracing)
+// OUTBOUND META GRAPH API HELPERS
 // ============================================================================
 async function sendWhatsAppMessage(recipientPhone, messageText, senderPhoneId = PHONE_ID_MAIN) {
   try {
@@ -154,7 +154,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneI
 // ============================================================================
 // GEMINI SUPPORT & USER STORY GENERATOR
 // ============================================================================
-async function handleSupportAndBacklogAgent(senderPhone, userMessage) {
+async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromPhoneId = PHONE_ID_SUPPORT) {
   try {
     const prompt = `
 You are the AI Concierge Support & Product Agent for "Ponte Concierge" at Ponte City, Johannesburg.
@@ -200,8 +200,8 @@ Instructions:
     const parsed = JSON.parse(response.text.trim());
     console.log(`🤖 [GEMINI SUCCESS] Category: ${parsed.category} | Reply: "${parsed.replyText}"`);
 
-    // Reply back to user via the Support line (072)
-    await sendWhatsAppMessage(senderPhone, parsed.replyText, PHONE_ID_SUPPORT);
+    // Dynamic outbound send using the receiving line ID
+    await sendWhatsAppMessage(senderPhone, parsed.replyText, replyFromPhoneId);
 
     // Staging Feature Requests
     if (parsed.category === 'FEATURE_REQUEST' && parsed.userStory) {
@@ -247,7 +247,7 @@ Instructions:
     await sendWhatsAppMessage(
       senderPhone,
       `Hello! Ponte Concierge Support has received your message. Our operational team will review it shortly.`,
-      PHONE_ID_SUPPORT
+      replyFromPhoneId
     );
   }
 }
@@ -790,17 +790,18 @@ app.post('/webhook', async (req, res) => {
 
     // =========================================================================
     // CHANNEL A: 072 SUPPORT LINE -> GEMINI AI TRIAGE & BACKLOG AGENT
-    // Matches ID 1448931934515007 OR Display Phone Number containing 729494561
+    // Matches ID 1448916934975007 OR Display Phone Number containing 729494561
     // =========================================================================
     const isSupportChannel = 
       recipientPhoneId === String(PHONE_ID_SUPPORT).trim() ||
-      recipientPhoneId === '1448931934515007' ||
+      recipientPhoneId === '1448916934975007' ||
       displayPhoneNumber.includes('729494561');
 
     if (isSupportChannel) {
       console.log(`🤖 [ROUTING] Handing off message to Gemini AI Support Agent for ${senderPhone}...`);
       if (messageType === 'text') {
-        await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim());
+        // Pass recipientPhoneId directly to guarantee outbound uses the receiving line ID
+        await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim(), recipientPhoneId);
       }
       return;
     }
