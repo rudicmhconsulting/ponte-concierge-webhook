@@ -185,7 +185,7 @@ Instructions:
 
     const parsed = JSON.parse(response.text.trim());
 
-    // Reply to resident via the Support line (072)
+    // Reply back to resident via the Support line (072)
     await sendWhatsAppMessage(senderPhone, parsed.replyText, PHONE_ID_SUPPORT);
 
     // Staging Feature Requests
@@ -749,7 +749,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ============================================================================
-// INBOUND MESSAGE PROCESSOR (POST)
+// INBOUND MESSAGE PROCESSOR (POST) - FAIL-SAFE ROUTING
 // ============================================================================
 app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
@@ -764,12 +764,25 @@ app.post('/webhook', async (req, res) => {
 
     const senderPhone = message.from;
     const messageType = message.type;
-    const recipientPhoneId = value?.metadata?.phone_number_id;
+    
+    // Extract metadata strings safely
+    const metadata = value?.metadata || {};
+    const recipientPhoneId = String(metadata.phone_number_id || '').trim();
+    const displayPhoneNumber = String(metadata.display_phone_number || '').trim();
+
+    console.log(`📥 [INBOUND] From: ${senderPhone} | To Phone ID: "${recipientPhoneId}" | Display No: "${displayPhoneNumber}" | Type: ${messageType}`);
 
     // =========================================================================
     // CHANNEL A: 072 SUPPORT LINE -> GEMINI AI TRIAGE & BACKLOG AGENT
+    // Matches ID 1448931934515007 OR Display Phone Number containing 729494561
     // =========================================================================
-    if (recipientPhoneId === PHONE_ID_SUPPORT) {
+    const isSupportChannel = 
+      recipientPhoneId === String(PHONE_ID_SUPPORT).trim() ||
+      recipientPhoneId === '1448931934515007' ||
+      displayPhoneNumber.includes('729494561');
+
+    if (isSupportChannel) {
+      console.log(`🤖 [ROUTING] Handing off message to Gemini AI Support Agent for ${senderPhone}...`);
       if (messageType === 'text') {
         await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim());
       }
@@ -779,6 +792,8 @@ app.post('/webhook', async (req, res) => {
     // =========================================================================
     // CHANNEL B: 081 MAIN ENGINE -> INTERACTIVE BUTTONS, OCR, DISPATCH
     // =========================================================================
+    console.log(`🏢 [ROUTING] Handing off message to Ponte Concierge Main Engine for ${senderPhone}...`);
+
     if (messageType === 'interactive' && message.interactive.type === 'button_reply') {
       const buttonId = message.interactive.button_reply.id;
 
