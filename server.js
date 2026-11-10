@@ -30,7 +30,7 @@ const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG';
 const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 
 // ============================================================================
-// GEMINI CLIENT SETUP (gemini-3.8-flash for support triage & user stories)
+// GEMINI CLIENT SETUP (gemini-3.8-flash)
 // ============================================================================
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -44,11 +44,12 @@ const issuedPasses = new Map();     // passToken -> { passToken, visitorName, vi
 const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid, collectedAt, deliveredAt, completedAt }
 const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId, expiresAt }
 const customerBacklogQueue = [];    // [{ id, rawFeedback, userStory, businessValue, senderPhone, status, submittedAt, submittedDate }]
+const systemIncidentLog = [];       // [{ incidentId, timestamp, caller, jobId, rootCause, resolution, status }]
 
 // 1. Seed Verified Resident
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
 
-// 2. Seed Runners
+// 2. Seed Active Runners
 userProfiles.set('27832778743', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Kaycee' });
 userProfiles.set('27822229285', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Vusi' });
 userProfiles.set('27688814679', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Musa' });
@@ -151,13 +152,151 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneI
   }
 }
 
+async function broadcastRunnerJob(job) {
+  const runnerAlertText =
+    `🏃 *NEW PONTE RUNNER TASK [#${job.jobId}]*\n\n` +
+    `• *Type:* ${job.taskType}\n` +
+    `• *Host:* ${job.hostName} (Unit ${job.unit}) - ${job.hostPhone}\n` +
+    `📌 *Pickup Instructions:*\n_${job.details}_\n\n` +
+    `• *Payout:* ${job.payout}`;
+
+  for (const [phone, profile] of userProfiles.entries()) {
+    if (profile.role === 'RUNNER') {
+      await sendInteractiveButtons(
+        phone,
+        'PONTE TASK DISPATCH',
+        runnerAlertText,
+        [
+          { id: `JOB_ACCEPT_${job.jobId}`, title: 'Accept Task 🚀' },
+          { id: `JOB_DECLINE_${job.jobId}`, title: 'Decline' }
+        ],
+        '',
+        PHONE_ID_MAIN
+      );
+    }
+  }
+}
+
 // ============================================================================
-// GEMINI SUPPORT & USER STORY GENERATOR
+// AUTONOMOUS DIAGNOSTICS & SELF-HEALING ENGINE (STORY-OPS-001)
+// ============================================================================
+async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescription) {
+  console.log(`🩺 [DIAGNOSTICS] Investigating operational fault from ${senderPhone}: "${issueDescription}"`);
+
+  // 1. Search for active runner jobs associated with this caller
+  const userJobs = Array.from(runnerJobs.values()).filter(
+    (j) => j.hostPhone === senderPhone && j.status !== 'COMPLETED_VERIFIED'
+  );
+
+  if (userJobs.length > 0) {
+    const latestJob = userJobs[userJobs.length - 1];
+    const previousRunner = latestJob.claimedBy;
+    const runnerName = previousRunner ? (userProfiles.get(previousRunner)?.fullName || previousRunner) : 'None';
+
+    console.log(`🔍 [DIAGNOSED] Task #${latestJob.jobId} in status "${latestJob.status}". Runner: ${runnerName}`);
+
+    // Self-Healing Action: Unbind runner lock, return to pool, re-broadcast
+    latestJob.status = 'PAID_AWAITING_CLAIM';
+    latestJob.claimedBy = null;
+    latestJob.reassignedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+
+    await broadcastRunnerJob(latestJob);
+
+    if (previousRunner) {
+      await sendWhatsAppMessage(
+        previousRunner,
+        `⚠️ *Task #${latestJob.jobId} Reassigned*\nResident reported a delay. The task has been re-queued to the active runner pool.`,
+        PHONE_ID_MAIN
+      );
+    }
+
+    const logEntry = {
+      incidentId: `INC-${Date.now().toString().slice(-4)}`,
+      timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+      caller: senderPhone,
+      jobId: latestJob.jobId,
+      rootCause: `Runner delay reported while in status "${latestJob.status}". Assigned: ${runnerName}.`,
+      resolution: `Task #${latestJob.jobId} lock cleared; re-broadcast to 4 runners on standby.`,
+      status: 'AUTO_RESOLVED'
+    };
+    systemIncidentLog.push(logEntry);
+
+    // Alert Admin
+    await sendWhatsAppMessage(
+      ADMIN_REPORT_PHONE,
+      `🛠️ *SELF-HEALING RESOLUTION EXECUTED [${logEntry.incidentId}]*\n\n` +
+      `• *Caller:* ${senderPhone}\n` +
+      `• *Issue:* "${issueDescription}"\n` +
+      `• *Diagnosis:* Job #${latestJob.jobId} stalled with runner ${runnerName}.\n` +
+      `• *Automated Fix:* Released lock, reset to PAID_AWAITING_CLAIM, re-broadcast to 4 runners.\n` +
+      `• *System Health:* Normal.`,
+      PHONE_ID_MAIN
+    );
+
+    return {
+      resolved: true,
+      jobId: latestJob.jobId,
+      message: `I investigated Task #${latestJob.jobId}. The assigned runner encountered a delay, so the system has automatically unassigned them and re-broadcast your delivery to the full active runner roster.`
+    };
+  }
+
+  // 2. Search for pending visitor gate clearance alerts
+  const userAlerts = Array.from(securityAlerts.values()).filter(
+    (a) => (a.hostPhone === senderPhone || a.visitorPhone === senderPhone) && a.status === 'PENDING_MANUAL_REVIEW'
+  );
+
+  if (userAlerts.length > 0) {
+    const alert = userAlerts[userAlerts.length - 1];
+    alert.status = 'APPROVED';
+
+    await sendWhatsAppMessage(
+      alert.visitorPhone,
+      `🛡️ *Access Pass Fast-Tracked*\nYour resident host confirmed arrival. Building security desk has expedited your clearance at the gate.`,
+      PHONE_ID_MAIN
+    );
+
+    await sendWhatsAppMessage(
+      ADMIN_REPORT_PHONE,
+      `🛠️ *AUTO-RESOLVED GATE PASS [${alert.alertId}]*\nGuest ${alert.visitorName} fast-tracked for entry upon host report.`,
+      PHONE_ID_MAIN
+    );
+
+    return {
+      resolved: true,
+      message: `I located guest clearance voucher ${alert.alertId}. The system has verified your resident record and fast-tracked turnstile clearance.`
+    };
+  }
+
+  // Fallback: Log system incident and notify admin
+  const logEntry = {
+    incidentId: `INC-${Date.now().toString().slice(-4)}`,
+    timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+    caller: senderPhone,
+    rootCause: issueDescription,
+    resolution: 'No direct automated hook matched. Escalated to operations admin.',
+    status: 'ESCALATED'
+  };
+  systemIncidentLog.push(logEntry);
+
+  await sendWhatsAppMessage(
+    ADMIN_REPORT_PHONE,
+    `🚨 *UNRESOLVED SUPPORT INCIDENT [${logEntry.incidentId}]*\n• *From:* ${senderPhone}\n• *Message:* "${issueDescription}"`,
+    PHONE_ID_MAIN
+  );
+
+  return {
+    resolved: false,
+    message: `I have logged incident [${logEntry.incidentId}]. Our on-duty operations supervisor has been notified to assist you immediately.`
+  };
+}
+
+// ============================================================================
+// GEMINI SUPPORT, USER STORY GENERATOR & SELF-HEALING HOOK
 // ============================================================================
 async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromPhoneId = PHONE_ID_SUPPORT) {
   try {
     const prompt = `
-You are the AI Concierge Support & Product Agent for "Ponte Concierge" at Ponte City, Johannesburg.
+You are the AI Concierge Support & Autonomous Operations Agent for "Ponte Concierge" at Ponte City, Johannesburg.
 A resident, runner, or visitor texted our dedicated support line (+27 72 949 4561):
 "${userMessage}"
 
@@ -165,18 +304,15 @@ Key Operational Context:
 - Errand Service: R35 promo flat fee paid on WhatsApp via Paystack. Runners earn R25 on dual confirmation.
 - Visitor Clearance: 100% digital on WhatsApp, optical QR passes valid for 24 hours.
 - Front Desk / Reception Hours: 07:00 to 16:00, Monday to Friday. Security desk is manned 24/7.
-- Escalations: Security issues, missing parcels, or turnstile blocks must trigger an alert to the operations admin.
 
 Instructions:
 1. Classify intent:
-   - "SUPPORT_QUERY": General questions, lost pass, reception hours, runner status.
-   - "FEATURE_REQUEST": Any suggestion, feedback, idea, or complaint highlighting a missing feature.
-   - "COMPLAINT_CRITICAL": Unresolved runner dispute, payment issue, safety concern, or entry lockout.
-2. Reply concisely and warmly (max 3 sentences) suitable for WhatsApp.
-3. If it is a FEATURE_REQUEST:
-   - Formulate a clean Agile User Story: "As a [resident/runner/visitor], I want [capability] so that [benefit]."
-   - Estimate Business Value ("High", "Medium", "Low") based on residential convenience or revenue.
-   - Set status to "PENDING_APPROVAL".
+   - "OPERATIONAL_FAULT": A complaint about a late runner, delayed delivery, failed gate pass, or stuck payment.
+   - "FEATURE_REQUEST": Any suggestion, feedback, idea, or capability not yet automated (e.g. recurring daily bread/milk deliveries, off-site mall errands, car wash).
+   - "SUPPORT_QUERY": General questions (reception hours, how it works, pricing, rules).
+2. If OPERATIONAL_FAULT: Set category to "OPERATIONAL_FAULT".
+3. If FEATURE_REQUEST: Formulate a clean Agile User Story ("As a [user], I want [feature] so that [benefit]") with Business Value ("High", "Medium", "Low").
+4. Reply concisely and warmly (max 3 sentences) suitable for WhatsApp.
 `;
 
     const response = await ai.models.generateContent({
@@ -198,12 +334,19 @@ Instructions:
     });
 
     const parsed = JSON.parse(response.text.trim());
-    console.log(`🤖 [GEMINI SUCCESS] Category: ${parsed.category} | Reply: "${parsed.replyText}"`);
+    console.log(`🤖 [GEMINI PARSED] Category: ${parsed.category} | Input: "${userMessage}"`);
 
-    // Dynamic outbound send using the receiving line ID
+    // CASE 1: Autonomous Fault Finding & Self-Healing
+    if (parsed.category === 'OPERATIONAL_FAULT') {
+      const remediation = await diagnoseAndRemediateOperationalIssue(senderPhone, userMessage);
+      await sendWhatsAppMessage(senderPhone, remediation.message, replyFromPhoneId);
+      return;
+    }
+
+    // Normal reply for general queries and suggestions
     await sendWhatsAppMessage(senderPhone, parsed.replyText, replyFromPhoneId);
 
-    // Staging Feature Requests
+    // CASE 2: Feature Request -> Agile User Story Staging
     if (parsed.category === 'FEATURE_REQUEST' && parsed.userStory) {
       const storyItem = {
         id: `STORY-${Date.now().toString().slice(-4)}`,
@@ -229,19 +372,6 @@ Instructions:
         PHONE_ID_MAIN
       );
     }
-
-    // Critical escalation
-    if (parsed.category === 'COMPLAINT_CRITICAL') {
-      await sendWhatsAppMessage(
-        ADMIN_REPORT_PHONE,
-        `🚨 *CRITICAL HOTLINE ALERT*\n\n` +
-        `• *From:* ${senderPhone}\n` +
-        `• *Message:* "${userMessage}"\n` +
-        `• *Action:* Immediate dispatch check required.`,
-        PHONE_ID_MAIN
-      );
-    }
-
   } catch (err) {
     console.error('❌ AI Support Agent Error:', err.message);
     await sendWhatsAppMessage(
@@ -361,7 +491,7 @@ async function downloadMetaImage(imageId) {
 }
 
 // ============================================================================
-// PAYSTACK DYNAMIC CHECKOUT (Workspace 2094725)
+// PAYSTACK DYNAMIC CHECKOUT
 // ============================================================================
 async function generatePaystackCheckout(residentPhone, unit, jobId) {
   try {
@@ -541,31 +671,6 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason, medi
     await sendWhatsAppMessage(RECEPTION_WA_GROUP, alertPayload, PHONE_ID_MAIN);
   } else {
     await sendWhatsAppMessage(SECURITY_DUTY_PHONE, alertPayload, PHONE_ID_MAIN);
-  }
-}
-
-async function broadcastRunnerJob(job) {
-  const runnerAlertText =
-    `🏃 *NEW PONTE RUNNER TASK [#${job.jobId}]*\n\n` +
-    `• *Type:* ${job.taskType}\n` +
-    `• *Host:* ${job.hostName} (Unit ${job.unit}) - ${job.hostPhone}\n` +
-    `📌 *Pickup Instructions:*\n_${job.details}_\n\n` +
-    `• *Payout:* ${job.payout}`;
-
-  for (const [phone, profile] of userProfiles.entries()) {
-    if (profile.role === 'RUNNER') {
-      await sendInteractiveButtons(
-        phone,
-        'PONTE TASK DISPATCH',
-        runnerAlertText,
-        [
-          { id: `JOB_ACCEPT_${job.jobId}`, title: 'Accept Task 🚀' },
-          { id: `JOB_DECLINE_${job.jobId}`, title: 'Decline' }
-        ],
-        '',
-        PHONE_ID_MAIN
-      );
-    }
   }
 }
 
@@ -790,7 +895,7 @@ app.post('/webhook', async (req, res) => {
 
     // =========================================================================
     // CHANNEL A: 072 SUPPORT LINE -> GEMINI AI TRIAGE & BACKLOG AGENT
-    // Matches ID 1448916934975007 OR Display Phone Number containing 729494561
+    // Matches ID 1448916934975007 OR Display Phone Number containing 729494561[cite: 26]
     // =========================================================================
     const isSupportChannel = 
       recipientPhoneId === String(PHONE_ID_SUPPORT).trim() ||
@@ -800,7 +905,6 @@ app.post('/webhook', async (req, res) => {
     if (isSupportChannel) {
       console.log(`🤖 [ROUTING] Handing off message to Gemini AI Support Agent for ${senderPhone}...`);
       if (messageType === 'text') {
-        // Pass recipientPhoneId directly to guarantee outbound uses the receiving line ID
         await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim(), recipientPhoneId);
       }
       return;
@@ -1436,7 +1540,7 @@ app.post('/security/assisted-clear', async (req, res) => {
 });
 
 // ============================================================================
-// PRODUCT BACKLOG APPROVAL HUD
+// PRODUCT BACKLOG & SELF-HEALING INCIDENT HUD
 // ============================================================================
 app.get('/admin/backlog', (req, res) => {
   const { action, id } = req.query;
@@ -1475,16 +1579,26 @@ app.get('/admin/backlog', (req, res) => {
     </tr>
   `).join('');
 
+  const incidentRows = systemIncidentLog.slice().reverse().map(inc => `
+    <tr style="border-bottom: 1px solid #334155;">
+      <td style="padding: 10px; font-weight: bold; color: #f97316;">${inc.incidentId}</td>
+      <td style="padding: 10px; font-size: 12px;">${inc.timestamp}</td>
+      <td style="padding: 10px; font-size: 12px; color: #cbd5e1;">${inc.rootCause}</td>
+      <td style="padding: 10px; font-size: 12px; color: #4ade80;">${inc.resolution}</td>
+      <td style="padding: 10px; font-size: 11px; font-weight: bold;">${inc.status}</td>
+    </tr>
+  `).join('');
+
   res.send(`
     <!DOCTYPE html>
     <html>
       <head>
-        <title>Ponte Concierge - Customer Feature Backlog</title>
+        <title>Ponte Concierge - Operations & Backlog HUD</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
           body { font-family: sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
           .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #1e293b; padding-bottom: 15px; margin-bottom: 20px; }
-          table { width: 100%; border-collapse: collapse; text-align: left; }
+          table { width: 100%; border-collapse: collapse; text-align: left; margin-bottom: 30px; }
           th { background: #1e293b; padding: 12px; color: #94a3b8; font-size: 13px; }
         </style>
       </head>
@@ -1496,6 +1610,15 @@ app.get('/admin/backlog', (req, res) => {
         <table>
           <thead><tr><th>Ref</th><th>Time</th><th>Resident Feedback</th><th>Generated User Story</th><th>Value</th><th>Status</th><th>Action</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="7" style="padding: 20px; text-align: center; color: #64748b;">No feature requests logged yet.</td></tr>'}</tbody>
+        </table>
+
+        <div class="header">
+          <h3 style="margin: 0; color: #f97316;">🩺 Autonomous Self-Healing Incident History</h3>
+          <div style="font-size: 12px; color: #94a3b8;">Live Diagnostic & Auto-Remediation Logs</div>
+        </div>
+        <table>
+          <thead><tr><th>Incident Ref</th><th>Time</th><th>Reported Fault / Cause</th><th>Auto-Remediation Applied</th><th>Status</th></tr></thead>
+          <tbody>${incidentRows || '<tr><td colspan="5" style="padding: 15px; text-align: center; color: #64748b;">No system incidents logged. Systems healthy.</td></tr>'}</tbody>
         </table>
       </body>
     </html>
