@@ -33,7 +33,7 @@ const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG';
 const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 
 // ============================================================================
-// GEMINI CLIENT SETUP (gemini-3.8-flash)
+// GEMINI CLIENT SETUP (gemini-2.5-flash)
 // ============================================================================
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -387,7 +387,7 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
 
     return {
       resolved: true,
-      message: `🛠️ *Auto-Fix Executed [${logEntry.incidentId}]:* Render's sleep cycle skipped the internal 20:00 timer. I have dispatched today's Daily Audit Report to your admin WhatsApp right now and saved the incident record to PostgreSQL.`
+      message: `🛠️ *Auto-Fix Executed [${logEntry.incidentId}]:* Render's sleep cycle skipped the internal 20:00 timer. I have dispatched today's Daily Audit Report to your admin WhatsApp right now and logged the incident in the HUD.`
     };
   }
 
@@ -533,14 +533,30 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
 
   return {
     resolved: false,
-    message: `I have logged incident [${logEntry.incidentId}] permanently in the Operations HUD and notified the admin team.`
+    message: `I have logged incident [${logEntry.incidentId}] in the Operations HUD and notified the admin team.`
   };
 }
 
 // ============================================================================
-// GEMINI SUPPORT, USER STORY GENERATOR & SELF-HEALING HOOK
+// DETERMINISTIC FAULT FAST-PATH + GEMINI 2.5 FLASH SUPPORT & BACKLOG AGENT
 // ============================================================================
 async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromPhoneId = PHONE_ID_SUPPORT) {
+  const lowerMsg = userMessage.toLowerCase();
+
+  // 1. DETERMINISTIC FAST-PATH FOR SYSTEM & OPS FAULTS (Zero AI API Dependency)
+  const faultKeywords = [
+    'audit', 'report', '20:00', 'schedule', 'hud', 'backlog', 'status',
+    'db', 'database', 'memory', 'late', 'runner', 'stuck', 'delay',
+    'gate', 'pass', 'broken', 'error', 'not running', 'not working', 'issue'
+  ];
+
+  if (faultKeywords.some((kw) => lowerMsg.includes(kw))) {
+    const remediation = await diagnoseAndRemediateOperationalIssue(senderPhone, userMessage);
+    await sendWhatsAppMessage(senderPhone, remediation.message, replyFromPhoneId);
+    return;
+  }
+
+  // 2. GEMINI AI TRIAGE FOR FEATURE REQUESTS & GENERAL SUPPORT
   try {
     const prompt = `
 You are the AI Concierge Support & Autonomous Operations Agent for "Ponte Concierge" at Ponte City, Johannesburg.
@@ -554,16 +570,14 @@ Key Operational Context:
 
 Instructions:
 1. Classify intent:
-   - "OPERATIONAL_FAULT": Any report of a bug, broken report, missed audit, HUD issue, status check, late runner, delayed delivery, failed gate pass, or stuck payment.
    - "FEATURE_REQUEST": Any suggestion, feedback, idea, or capability not yet automated (e.g. recurring daily bread/milk deliveries, off-site mall errands, car wash).
    - "SUPPORT_QUERY": General questions (reception hours, how it works, pricing, rules).
-2. If OPERATIONAL_FAULT: Set category to "OPERATIONAL_FAULT".
-3. If FEATURE_REQUEST: Formulate a clean Agile User Story ("As a [user], I want [feature] so that [benefit]") with Business Value ("High", "Medium", "Low").
-4. Reply concisely and warmly (max 3 sentences) suitable for WhatsApp.
+2. If FEATURE_REQUEST: Formulate a clean Agile User Story ("As a [user], I want [feature] so that [benefit]") with Business Value ("High", "Medium", "Low").
+3. Reply concisely and warmly (max 3 sentences) suitable for WhatsApp.
 `;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -583,17 +597,8 @@ Instructions:
     const parsed = JSON.parse(response.text.trim());
     console.log(`🤖 [GEMINI PARSED] Category: ${parsed.category} | Input: "${userMessage}"`);
 
-    // CASE 1: Autonomous Fault Finding & Self-Healing
-    if (parsed.category === 'OPERATIONAL_FAULT') {
-      const remediation = await diagnoseAndRemediateOperationalIssue(senderPhone, userMessage);
-      await sendWhatsAppMessage(senderPhone, remediation.message, replyFromPhoneId);
-      return;
-    }
-
-    // Normal reply for general queries and suggestions
     await sendWhatsAppMessage(senderPhone, parsed.replyText, replyFromPhoneId);
 
-    // CASE 2: Feature Request -> Agile User Story Staging (Persisted to DB)
     if (parsed.category === 'FEATURE_REQUEST' && parsed.userStory) {
       const storyItem = {
         id: `STORY-${Date.now().toString().slice(-4)}`,
@@ -1159,7 +1164,7 @@ app.post('/webhook', async (req, res) => {
     console.log(`📥 [INBOUND] From: ${senderPhone} | To Phone ID: "${recipientPhoneId}" | Display No: "${displayPhoneNumber}" | Type: ${messageType}`);
 
     // =========================================================================
-    // CHANNEL A: 072 SUPPORT LINE -> GEMINI AI TRIAGE, BACKLOG & SELF-HEALING
+    // CHANNEL A: 072 SUPPORT LINE -> DETERMINISTIC FAST-PATH + GEMINI 2.5 FLASH
     // =========================================================================
     const isSupportChannel =
       recipientPhoneId === String(PHONE_ID_SUPPORT).trim() ||
@@ -1167,7 +1172,7 @@ app.post('/webhook', async (req, res) => {
       displayPhoneNumber.includes('729494561');
 
     if (isSupportChannel) {
-      console.log(`🤖 [ROUTING] Handing off message to Gemini AI Support & Self-Healing Agent for ${senderPhone}...`);
+      console.log(`🤖 [ROUTING] Handing off message to Support & Self-Healing Agent for ${senderPhone}...`);
       if (messageType === 'text') {
         await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim(), recipientPhoneId);
       }
