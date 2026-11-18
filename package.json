@@ -1,18 +1,20 @@
 {
   "name": "ponte-concierge-webhook",
-  "version": "1.0.0",
-  "description": "Ponte Concierge Dual-Channel Operations and AI Backlog Engine",
+  "version": "1.2.0",
+  "description": "Ponte Concierge Dual-Channel WhatsApp Engine, OCR Clearance, Self-Healing Ops & PostgreSQL Persistence",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@google/genai": "latest",
-    "express": "^4.19.2",
-    "sharp": "^0.33.2",
-    "tesseract.js": "^5.0.4"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "express": "^4.21.1",
+    "pg": "^8.13.0",
+    "sharp": "^0.33.5",
+    "tesseract.js": "^5.1.1"
   }
 }
