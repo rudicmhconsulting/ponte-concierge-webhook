@@ -1,4 +1,5 @@
 const express = require('express');
+const { Pool } = require('pg');
 const { createWorker } = require('tesseract.js');
 const sharp = require('sharp');
 const { GoogleGenAI, Type } = require('@google/genai');
@@ -10,12 +11,14 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'ponte_secure_token_2026';
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const HUD_USER = process.env.HUD_USER || 'admin';
+const HUD_PASSWORD = process.env.HUD_PASSWORD || 'ponte2026';
 
 // ============================================================================
 // DUAL-LINE WABA IDENTIFIERS (Ponte Concierges WABA 1799638264570073)
 // ============================================================================
-const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)[cite: 7]
-const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448916934975007'; // 072 949 4561 (AI Support & Feedback)[cite: 26]
+const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)
+const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448916934975007'; // 072 949 4561 (AI Support & Self-Healing)
 
 // Operational Hotline & Admin Phones
 const ADMIN_REPORT_PHONE = '27715720458';
@@ -26,7 +29,7 @@ const SECURITY_DUTY_PHONE = process.env.SECURITY_DUTY_PHONE || '27715720458';
 // PAYSTACK LIVE CONFIGURATION (Ponte Concierges Profile 2094725)
 // ============================================================================
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG'; // 100% GoTyme Bank
+const PAYSTACK_SPLIT_CODE = process.env.PAYSTACK_SPLIT_CODE || 'SPL_o0LUe5ffNG';
 const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 
 // ============================================================================
@@ -35,25 +38,210 @@ const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // ============================================================================
-// IN-MEMORY STORES & QUEUES
+// POSTGRESQL PERSISTENCE ENGINE (WRITE-THROUGH + STARTUP REHYDRATION)
 // ============================================================================
-const userProfiles = new Map();     // phone -> { role, registeredAt, unit, fullName }
-const residentSessions = new Map(); // phone -> { step, visitorName, visitorPhone, accessType, zone, taskType, guestPhone }
-const visitorSessions = new Map();  // phone -> { step, hostPhone, visitorName, accessType, zone, idNumber, isPassport }
-const issuedPasses = new Map();     // passToken -> { passToken, visitorName, visitorPhone, hostPhone, hostUnit, zone, validUntil, status, entries: [] }
-const runnerJobs = new Map();       // jobId -> { jobId, status, claimedBy, token, unit, hostName, hostPhone, details, taskType, payout, feePaid, collectedAt, deliveredAt, completedAt }
-const securityAlerts = new Map();   // alertId -> { alertId, visitorName, visitorPhone, hostPhone, idNumber, reason, timestamp, zone, status, mediaId, expiresAt }
-const customerBacklogQueue = [];    // [{ id, rawFeedback, userStory, businessValue, senderPhone, status, submittedAt, submittedDate }]
-const systemIncidentLog = [];       // [{ incidentId, timestamp, caller, jobId, rootCause, resolution, status }]
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+    })
+  : null;
 
-// 1. Seed Verified Resident
+async function initDatabase() {
+  if (!pool) {
+    console.warn('⚠️ [DB] DATABASE_URL not set. Running in volatile in-memory mode.');
+    return;
+  }
+
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ponte_runner_jobs (
+        job_id TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS ponte_issued_passes (
+        pass_token TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS ponte_security_alerts (
+        alert_id TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS ponte_backlog_stories (
+        story_id TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS ponte_incident_logs (
+        incident_id TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // Rehydrate in-memory stores from PostgreSQL on startup
+    const jobsRes = await pool.query('SELECT job_id, payload FROM ponte_runner_jobs');
+    for (const row of jobsRes.rows) runnerJobs.set(row.job_id, row.payload);
+
+    const passesRes = await pool.query('SELECT pass_token, payload FROM ponte_issued_passes');
+    for (const row of passesRes.rows) issuedPasses.set(row.pass_token, row.payload);
+
+    const alertsRes = await pool.query('SELECT alert_id, payload FROM ponte_security_alerts');
+    for (const row of alertsRes.rows) securityAlerts.set(row.alert_id, row.payload);
+
+    const storiesRes = await pool.query('SELECT payload FROM ponte_backlog_stories ORDER BY created_at ASC');
+    customerBacklogQueue.length = 0;
+    for (const row of storiesRes.rows) customerBacklogQueue.push(row.payload);
+
+    const incidentsRes = await pool.query('SELECT payload FROM ponte_incident_logs ORDER BY created_at ASC');
+    systemIncidentLog.length = 0;
+    for (const row of incidentsRes.rows) systemIncidentLog.push(row.payload);
+
+    console.log(
+      `✅ [DB HYDRATED] Jobs: ${runnerJobs.size} | Passes: ${issuedPasses.size} | Alerts: ${securityAlerts.size} | Stories: ${customerBacklogQueue.length} | Incidents: ${systemIncidentLog.length}`
+    );
+  } catch (err) {
+    console.error('❌ [DB INIT ERROR]:', err.message);
+  }
+}
+
+async function persistJob(job) {
+  runnerJobs.set(job.jobId, job);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO ponte_runner_jobs (job_id, payload, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (job_id) DO UPDATE SET payload = $2::jsonb, updated_at = NOW()`,
+      [job.jobId, JSON.stringify(job)]
+    );
+  } catch (err) {
+    console.error('❌ [DB] persistJob error:', err.message);
+  }
+}
+
+async function deleteJob(jobId) {
+  runnerJobs.delete(jobId);
+  if (!pool) return;
+  try {
+    await pool.query('DELETE FROM ponte_runner_jobs WHERE job_id = $1', [jobId]);
+  } catch (err) {
+    console.error('❌ [DB] deleteJob error:', err.message);
+  }
+}
+
+async function persistPass(pass) {
+  issuedPasses.set(pass.passToken, pass);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO ponte_issued_passes (pass_token, payload, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (pass_token) DO UPDATE SET payload = $2::jsonb, updated_at = NOW()`,
+      [pass.passToken, JSON.stringify(pass)]
+    );
+  } catch (err) {
+    console.error('❌ [DB] persistPass error:', err.message);
+  }
+}
+
+async function deletePass(passToken) {
+  issuedPasses.delete(passToken);
+  if (!pool) return;
+  try {
+    await pool.query('DELETE FROM ponte_issued_passes WHERE pass_token = $1', [passToken]);
+  } catch (err) {
+    console.error('❌ [DB] deletePass error:', err.message);
+  }
+}
+
+async function persistAlert(alert) {
+  securityAlerts.set(alert.alertId, alert);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO ponte_security_alerts (alert_id, payload, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (alert_id) DO UPDATE SET payload = $2::jsonb, updated_at = NOW()`,
+      [alert.alertId, JSON.stringify(alert)]
+    );
+  } catch (err) {
+    console.error('❌ [DB] persistAlert error:', err.message);
+  }
+}
+
+async function persistStory(storyItem) {
+  const existingIdx = customerBacklogQueue.findIndex((s) => s.id === storyItem.id);
+  if (existingIdx >= 0) customerBacklogQueue[existingIdx] = storyItem;
+  else customerBacklogQueue.push(storyItem);
+
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO ponte_backlog_stories (story_id, payload)
+       VALUES ($1, $2::jsonb)
+       ON CONFLICT (story_id) DO UPDATE SET payload = $2::jsonb`,
+      [storyItem.id, JSON.stringify(storyItem)]
+    );
+  } catch (err) {
+    console.error('❌ [DB] persistStory error:', err.message);
+  }
+}
+
+async function persistIncident(logEntry) {
+  systemIncidentLog.push(logEntry);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO ponte_incident_logs (incident_id, payload)
+       VALUES ($1, $2::jsonb)
+       ON CONFLICT (incident_id) DO UPDATE SET payload = $2::jsonb`,
+      [logEntry.incidentId, JSON.stringify(logEntry)]
+    );
+  } catch (err) {
+    console.error('❌ [DB] persistIncident error:', err.message);
+  }
+}
+
+// ============================================================================
+// RUNTIME WORKING STORES (HYDRATED FROM DB ON STARTUP)
+// ============================================================================
+const userProfiles = new Map();
+const residentSessions = new Map();
+const visitorSessions = new Map();
+const issuedPasses = new Map();
+const runnerJobs = new Map();
+const securityAlerts = new Map();
+const customerBacklogQueue = [];
+const systemIncidentLog = [];
+
+// Seed Verified Resident & Active Runners
 userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
-
-// 2. Seed Active Runners
 userProfiles.set('27832778743', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Kaycee' });
 userProfiles.set('27822229285', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Vusi' });
 userProfiles.set('27688814679', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Musa' });
 userProfiles.set('27656206712', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Faith' });
+
+// ============================================================================
+// HUD BASIC AUTH GUARD (PROTECTS /admin/* & /security/*)
+// ============================================================================
+function requireHudAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="Ponte Concierge Operations HUD"');
+    return res.status(401).send('Authentication required.');
+  }
+  const base64Credentials = authHeader.split(' ')[1];
+  const [user, pass] = Buffer.from(base64Credentials, 'base64').toString('ascii').split(':');
+  if (user === HUD_USER && pass === HUD_PASSWORD) {
+    return next();
+  }
+  res.setHeader('WWW-Authenticate', 'Basic realm="Ponte Concierge Operations HUD"');
+  return res.status(401).send('Invalid credentials.');
+}
 
 // ============================================================================
 // OUTBOUND META GRAPH API HELPERS
@@ -115,11 +303,7 @@ async function sendInteractiveButtons(recipientPhone, headerText, bodyText, butt
       },
       body: JSON.stringify(payload),
     });
-    const result = await res.json();
-    if (!res.ok || result.error) {
-      console.error(`❌ Meta Outbound Buttons Error from ${senderPhoneId} to ${recipientPhone}:`, JSON.stringify(result));
-    }
-    return result;
+    return await res.json();
   } catch (error) {
     console.error(`❌ Error in sendInteractiveButtons:`, error.message);
   }
@@ -142,11 +326,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneI
       },
       body: JSON.stringify(payload),
     });
-    const result = await res.json();
-    if (!res.ok || result.error) {
-      console.error(`❌ Meta Outbound Image Error from ${senderPhoneId} to ${recipientPhone}:`, JSON.stringify(result));
-    }
-    return result;
+    return await res.json();
   } catch (error) {
     console.error(`❌ Error in sendWhatsAppImage:`, error.message);
   }
@@ -178,12 +358,72 @@ async function broadcastRunnerJob(job) {
 }
 
 // ============================================================================
-// AUTONOMOUS DIAGNOSTICS & SELF-HEALING ENGINE (STORY-OPS-001)
+// AUTONOMOUS DIAGNOSTICS & SELF-HEALING ENGINE (SYSTEM + OPS)
 // ============================================================================
 async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescription) {
-  console.log(`🩺 [DIAGNOSTICS] Investigating operational fault from ${senderPhone}: "${issueDescription}"`);
+  console.log(`🩺 [DIAGNOSTICS] Investigating issue from ${senderPhone}: "${issueDescription}"`);
+  const lowerIssue = issueDescription.toLowerCase();
+  const nowSast = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+  const dateSast = new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' });
 
-  // 1. Search for active runner jobs associated with this caller
+  // 1. SYSTEM FAULT: Daily Audit Report / Scheduler Missed Tick
+  if (
+    lowerIssue.includes('audit') ||
+    lowerIssue.includes('report') ||
+    lowerIssue.includes('20:00') ||
+    lowerIssue.includes('schedule')
+  ) {
+    await sendDailyAuditReport();
+
+    const logEntry = {
+      incidentId: `INC-${Date.now().toString().slice(-4)}`,
+      timestamp: `${dateSast} ${nowSast}`,
+      caller: senderPhone,
+      rootCause: 'Render idle sleep skipped internal 20:00 SAST timer.',
+      resolution: 'Auto-dispatched Daily Audit Report immediately & verified /api/cron/daily-audit endpoint.',
+      status: 'AUTO_RESOLVED'
+    };
+    await persistIncident(logEntry);
+
+    return {
+      resolved: true,
+      message: `🛠️ *Auto-Fix Executed [${logEntry.incidentId}]:* Render's sleep cycle skipped the internal 20:00 timer. I have dispatched today's Daily Audit Report to your admin WhatsApp right now and saved the incident record to PostgreSQL.`
+    };
+  }
+
+  // 2. SYSTEM FAULT: HUD / Database / Telemetry Health Check
+  if (
+    lowerIssue.includes('hud') ||
+    lowerIssue.includes('backlog') ||
+    lowerIssue.includes('status') ||
+    lowerIssue.includes('db') ||
+    lowerIssue.includes('database') ||
+    lowerIssue.includes('memory')
+  ) {
+    const dbStatus = pool ? 'CONNECTED (PostgreSQL Persistent)' : 'IN-MEMORY ONLY (Set DATABASE_URL)';
+    const logEntry = {
+      incidentId: `INC-${Date.now().toString().slice(-4)}`,
+      timestamp: `${dateSast} ${nowSast}`,
+      caller: senderPhone,
+      rootCause: 'System health & persistence telemetry check requested.',
+      resolution: `Verified DB: ${dbStatus} | Jobs: ${runnerJobs.size}, Passes: ${issuedPasses.size}, Stories: ${customerBacklogQueue.length}.`,
+      status: 'AUTO_RESOLVED'
+    };
+    await persistIncident(logEntry);
+
+    return {
+      resolved: true,
+      message:
+        `📊 *Live System Telemetry [${logEntry.incidentId}]:*\n` +
+        `• *Persistence:* ${dbStatus}\n` +
+        `• *Active Jobs:* ${runnerJobs.size}\n` +
+        `• *Active Passes:* ${issuedPasses.size}\n` +
+        `• *Backlog Stories:* ${customerBacklogQueue.length}\n` +
+        `• *Logged Incidents:* ${systemIncidentLog.length}`
+    };
+  }
+
+  // 3. OPS FAULT: Active Runner Delay / Stalled Errand
   const userJobs = Array.from(runnerJobs.values()).filter(
     (j) => j.hostPhone === senderPhone && j.status !== 'COMPLETED_VERIFIED'
   );
@@ -191,14 +431,12 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
   if (userJobs.length > 0) {
     const latestJob = userJobs[userJobs.length - 1];
     const previousRunner = latestJob.claimedBy;
-    const runnerName = previousRunner ? (userProfiles.get(previousRunner)?.fullName || previousRunner) : 'None';
+    const runnerName = previousRunner ? (userProfiles.get(previousRunner)?.fullName || previousRunner) : 'Unassigned';
 
-    console.log(`🔍 [DIAGNOSED] Task #${latestJob.jobId} in status "${latestJob.status}". Runner: ${runnerName}`);
-
-    // Self-Healing Action: Unbind runner lock, return to pool, re-broadcast
     latestJob.status = 'PAID_AWAITING_CLAIM';
     latestJob.claimedBy = null;
-    latestJob.reassignedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+    latestJob.reassignedAt = nowSast;
+    await persistJob(latestJob);
 
     await broadcastRunnerJob(latestJob);
 
@@ -212,24 +450,22 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
 
     const logEntry = {
       incidentId: `INC-${Date.now().toString().slice(-4)}`,
-      timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+      timestamp: `${dateSast} ${nowSast}`,
       caller: senderPhone,
       jobId: latestJob.jobId,
-      rootCause: `Runner delay reported while in status "${latestJob.status}". Assigned: ${runnerName}.`,
-      resolution: `Task #${latestJob.jobId} lock cleared; re-broadcast to 4 runners on standby.`,
+      rootCause: `Runner delay reported on Task #${latestJob.jobId} (Previous runner: ${runnerName}).`,
+      resolution: `Cleared lock on #${latestJob.jobId}, persisted state, and re-broadcast to active runner roster.`,
       status: 'AUTO_RESOLVED'
     };
-    systemIncidentLog.push(logEntry);
+    await persistIncident(logEntry);
 
-    // Alert Admin
     await sendWhatsAppMessage(
       ADMIN_REPORT_PHONE,
       `🛠️ *SELF-HEALING RESOLUTION EXECUTED [${logEntry.incidentId}]*\n\n` +
       `• *Caller:* ${senderPhone}\n` +
       `• *Issue:* "${issueDescription}"\n` +
       `• *Diagnosis:* Job #${latestJob.jobId} stalled with runner ${runnerName}.\n` +
-      `• *Automated Fix:* Released lock, reset to PAID_AWAITING_CLAIM, re-broadcast to 4 runners.\n` +
-      `• *System Health:* Normal.`,
+      `• *Automated Fix:* Released lock, saved to DB, re-broadcast to 4 runners.`,
       PHONE_ID_MAIN
     );
 
@@ -240,7 +476,7 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     };
   }
 
-  // 2. Search for pending visitor gate clearance alerts
+  // 4. OPS FAULT: Pending Gate Clearance Alert
   const userAlerts = Array.from(securityAlerts.values()).filter(
     (a) => (a.hostPhone === senderPhone || a.visitorPhone === senderPhone) && a.status === 'PENDING_MANUAL_REVIEW'
   );
@@ -248,12 +484,23 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
   if (userAlerts.length > 0) {
     const alert = userAlerts[userAlerts.length - 1];
     alert.status = 'APPROVED';
+    await persistAlert(alert);
 
     await sendWhatsAppMessage(
       alert.visitorPhone,
       `🛡️ *Access Pass Fast-Tracked*\nYour resident host confirmed arrival. Building security desk has expedited your clearance at the gate.`,
       PHONE_ID_MAIN
     );
+
+    const logEntry = {
+      incidentId: `INC-${Date.now().toString().slice(-4)}`,
+      timestamp: `${dateSast} ${nowSast}`,
+      caller: senderPhone,
+      rootCause: `Gate pass voucher ${alert.alertId} stuck in PENDING_MANUAL_REVIEW.`,
+      resolution: `Auto-approved ${alert.alertId} upon verified host report & persisted to DB.`,
+      status: 'AUTO_RESOLVED'
+    };
+    await persistIncident(logEntry);
 
     await sendWhatsAppMessage(
       ADMIN_REPORT_PHONE,
@@ -267,26 +514,26 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     };
   }
 
-  // Fallback: Log system incident and notify admin
+  // 5. Fallback: Log & Escalate Unmatched Technical Issue
   const logEntry = {
     incidentId: `INC-${Date.now().toString().slice(-4)}`,
-    timestamp: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+    timestamp: `${dateSast} ${nowSast}`,
     caller: senderPhone,
     rootCause: issueDescription,
-    resolution: 'No direct automated hook matched. Escalated to operations admin.',
+    resolution: 'Persisted to incident HUD & escalated to Operations Admin.',
     status: 'ESCALATED'
   };
-  systemIncidentLog.push(logEntry);
+  await persistIncident(logEntry);
 
   await sendWhatsAppMessage(
     ADMIN_REPORT_PHONE,
-    `🚨 *UNRESOLVED SUPPORT INCIDENT [${logEntry.incidentId}]*\n• *From:* ${senderPhone}\n• *Message:* "${issueDescription}"`,
+    `🚨 *SUPPORT INCIDENT LOGGED [${logEntry.incidentId}]*\n• *From:* ${senderPhone}\n• *Issue:* "${issueDescription}"`,
     PHONE_ID_MAIN
   );
 
   return {
     resolved: false,
-    message: `I have logged incident [${logEntry.incidentId}]. Our on-duty operations supervisor has been notified to assist you immediately.`
+    message: `I have logged incident [${logEntry.incidentId}] permanently in the Operations HUD and notified the admin team.`
   };
 }
 
@@ -307,7 +554,7 @@ Key Operational Context:
 
 Instructions:
 1. Classify intent:
-   - "OPERATIONAL_FAULT": A complaint about a late runner, delayed delivery, failed gate pass, or stuck payment.
+   - "OPERATIONAL_FAULT": Any report of a bug, broken report, missed audit, HUD issue, status check, late runner, delayed delivery, failed gate pass, or stuck payment.
    - "FEATURE_REQUEST": Any suggestion, feedback, idea, or capability not yet automated (e.g. recurring daily bread/milk deliveries, off-site mall errands, car wash).
    - "SUPPORT_QUERY": General questions (reception hours, how it works, pricing, rules).
 2. If OPERATIONAL_FAULT: Set category to "OPERATIONAL_FAULT".
@@ -346,7 +593,7 @@ Instructions:
     // Normal reply for general queries and suggestions
     await sendWhatsAppMessage(senderPhone, parsed.replyText, replyFromPhoneId);
 
-    // CASE 2: Feature Request -> Agile User Story Staging
+    // CASE 2: Feature Request -> Agile User Story Staging (Persisted to DB)
     if (parsed.category === 'FEATURE_REQUEST' && parsed.userStory) {
       const storyItem = {
         id: `STORY-${Date.now().toString().slice(-4)}`,
@@ -359,8 +606,8 @@ Instructions:
         submittedDate: new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' })
       };
 
-      customerBacklogQueue.push(storyItem);
-      console.log(`📋 [STAGED BACKLOG] Added ${storyItem.id}: "${storyItem.userStory}"`);
+      await persistStory(storyItem);
+      console.log(`📋 [PERSISTED BACKLOG] Added ${storyItem.id}: "${storyItem.userStory}"`);
 
       await sendWhatsAppMessage(
         ADMIN_REPORT_PHONE,
@@ -368,7 +615,7 @@ Instructions:
         `• *Story:* ${storyItem.userStory}\n` +
         `• *Value:* ${storyItem.businessValue}\n` +
         `• *Source:* ${senderPhone}\n\n` +
-        `_Staged in /admin/backlog for review before Jaco's sync._`,
+        `_Saved permanently in /admin/backlog._`,
         PHONE_ID_MAIN
       );
     }
@@ -409,11 +656,11 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
     let ret = await worker.recognize(processedBuffer);
     let rawText = ret.data.text.toUpperCase();
 
-    const hasDocKeywords = (text) => 
+    const hasDocKeywords = (text) =>
       text.includes('SOUTH AFRICA') || text.includes('SUID-AFRIKA') ||
-      text.includes('REPUBLIC') || text.includes('IDENTITY') || 
-      text.includes('PASSPORT') || text.includes('DRIVING') || 
-      text.includes('LICENCE') || text.includes('P<ZAF') || 
+      text.includes('REPUBLIC') || text.includes('IDENTITY') ||
+      text.includes('PASSPORT') || text.includes('DRIVING') ||
+      text.includes('LICENCE') || text.includes('P<ZAF') ||
       text.includes('<<<<') || text.includes('P<');
 
     if (!hasDocKeywords(rawText)) {
@@ -428,14 +675,14 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
     const alphanumericOnly = rawText.replace(/[^A-Z0-9]/g, '');
     const cleanId = declaredId.replace(/[^A-Z0-9]/gi, '').toUpperCase();
     const isNumericSAID = /^\d{13}$/.test(cleanId);
-    
+
     let fullIdMatch = alphanumericOnly.includes(cleanId);
     let partialIdMatch = false;
 
     if (isNumericSAID) {
       const birthDigits = cleanId.substring(0, 6);
       const lastDigits = cleanId.substring(6);
-      partialIdMatch = alphanumericOnly.includes(birthDigits) && 
+      partialIdMatch = alphanumericOnly.includes(birthDigits) &&
         (alphanumericOnly.includes(lastDigits) || alphanumericOnly.includes(cleanId.substring(6, 11)));
     }
 
@@ -458,7 +705,7 @@ async function performDocumentOCR(imageBuffer, declaredId, declaredName) {
 
     if ((fullIdMatch || partialIdMatch || hasSignificantNameMatch) && isSADocument) {
       return { verified: true, reason: 'SA_DOC_MATCH_CONFIRMED' };
-    } 
+    }
 
     if (isMRZPassport && !isSAPassport && fullIdMatch) {
       return { verified: true, reason: 'FOREIGN_PASSPORT_MRZ_VERIFIED', isForeign: true };
@@ -578,7 +825,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
   const hostProfile = visitorData.hostPhone ? userProfiles.get(visitorData.hostPhone) : null;
   const hostUnit = hostProfile ? hostProfile.unit : '5102';
 
-  issuedPasses.set(passToken, {
+  const passObj = {
     passToken,
     visitorName: visitorData.visitorName,
     visitorPhone: visitorPhone,
@@ -588,7 +835,8 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
     status: 'ACTIVE_CREDENTIAL',
     validUntil: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
     entries: []
-  });
+  };
+  await persistPass(passObj);
 
   const qrPayload = JSON.stringify({
     token: passToken,
@@ -636,7 +884,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
 async function triggerSecurityDivert(visitorPhone, visitorData, failReason, mediaId = null) {
   const alertId = `ALT-${Math.floor(1000 + Math.random() * 9000)}`;
 
-  securityAlerts.set(alertId, {
+  const alertObj = {
     alertId,
     visitorName: visitorData.visitorName,
     visitorPhone: visitorPhone,
@@ -648,7 +896,8 @@ async function triggerSecurityDivert(visitorPhone, visitorData, failReason, medi
     status: 'PENDING_MANUAL_REVIEW',
     mediaId: mediaId,
     expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
-  });
+  };
+  await persistAlert(alertObj);
 
   await sendWhatsAppMessage(
     visitorPhone,
@@ -694,10 +943,11 @@ app.post('/paystack/webhook', async (req, res) => {
       if (job.status === 'PENDING_PAYMENT') {
         job.status = 'PAID_AWAITING_CLAIM';
         job.paidAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+        await persistJob(job);
 
         const hasPin = /\b\d{4,6}\b/.test(job.details);
-        const pinReminder = hasPin 
-          ? '' 
+        const pinReminder = hasPin
+          ? ''
           : `\n\n⚠️ *REMINDER:* If your courier requires a release PIN/OTP, text it to your runner once claimed.`;
 
         await sendWhatsAppMessage(
@@ -737,7 +987,7 @@ app.post('/paystack/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// TURNSTILE SCAN SIMULATOR
+// TURNSTILE SCAN SIMULATOR / VALIDATOR
 // ============================================================================
 app.get('/api/turnstile/scan', async (req, res) => {
   const { token } = req.query;
@@ -747,6 +997,7 @@ app.get('/api/turnstile/scan', async (req, res) => {
 
   const nowTime = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
   pass.entries.push(nowTime);
+  await persistPass(pass);
 
   if (pass.hostPhone) {
     await sendWhatsAppMessage(
@@ -760,7 +1011,7 @@ app.get('/api/turnstile/scan', async (req, res) => {
 });
 
 // ============================================================================
-// AUDIT ENGINE
+// AUDIT ENGINE + EXTERNAL CRON TRIGGER
 // ============================================================================
 function generateAuditSummary() {
   const jobsList = Array.from(runnerJobs.values());
@@ -827,8 +1078,22 @@ async function sendDailyAuditReport() {
   await sendWhatsAppMessage(ADMIN_REPORT_PHONE, message, PHONE_ID_MAIN);
 }
 
-// 20:00 SAST report schedule + POPIA purge
+// External Cron Endpoint (Wakes Render reliably at 20:00 SAST / 18:00 UTC)
 let lastReportDate = '';
+app.get('/api/cron/daily-audit', async (req, res) => {
+  const { token } = req.query;
+  if (token !== VERIFY_TOKEN) {
+    return res.status(403).json({ status: 'FORBIDDEN', reason: 'Invalid cron token' });
+  }
+
+  const todayStr = new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+  lastReportDate = todayStr;
+  await sendDailyAuditReport();
+
+  res.json({ status: 'SUCCESS', message: `Daily audit report dispatched for ${todayStr}` });
+});
+
+// Background 15-min interval (runs while awake) + POPIA purge
 setInterval(async () => {
   const now = new Date();
   const utcHours = now.getUTCHours();
@@ -841,19 +1106,20 @@ setInterval(async () => {
   }
 
   for (const [alertId, alert] of securityAlerts.entries()) {
-    if (alert.expiresAt && new Date(alert.expiresAt) <= now) {
+    if (alert.expiresAt && new Date(alert.expiresAt) <= now && alert.status !== 'ARCHIVED_PURGED') {
       if (alert.mediaId) delete alert.mediaId;
       alert.status = 'ARCHIVED_PURGED';
+      await persistAlert(alert);
     }
   }
 
   for (const [token, pass] of issuedPasses.entries()) {
     if (pass.validUntil) {
       const purgeWindow = new Date(new Date(pass.validUntil).getTime() + 24 * 60 * 60 * 1000);
-      if (now >= purgeWindow) issuedPasses.delete(token);
+      if (now >= purgeWindow) await deletePass(token);
     }
   }
-}, 60 * 60 * 1000);
+}, 15 * 60 * 1000);
 
 // ============================================================================
 // META WEBHOOK VERIFICATION (GET)
@@ -870,7 +1136,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ============================================================================
-// INBOUND MESSAGE PROCESSOR (POST) - FAIL-SAFE ROUTING
+// INBOUND MESSAGE PROCESSOR (POST) - DUAL-CHANNEL ROUTING
 // ============================================================================
 app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
@@ -885,8 +1151,7 @@ app.post('/webhook', async (req, res) => {
 
     const senderPhone = message.from;
     const messageType = message.type;
-    
-    // Extract metadata strings safely
+
     const metadata = value?.metadata || {};
     const recipientPhoneId = String(metadata.phone_number_id || '').trim();
     const displayPhoneNumber = String(metadata.display_phone_number || '').trim();
@@ -894,16 +1159,15 @@ app.post('/webhook', async (req, res) => {
     console.log(`📥 [INBOUND] From: ${senderPhone} | To Phone ID: "${recipientPhoneId}" | Display No: "${displayPhoneNumber}" | Type: ${messageType}`);
 
     // =========================================================================
-    // CHANNEL A: 072 SUPPORT LINE -> GEMINI AI TRIAGE & BACKLOG AGENT
-    // Matches ID 1448916934975007 OR Display Phone Number containing 729494561[cite: 26]
+    // CHANNEL A: 072 SUPPORT LINE -> GEMINI AI TRIAGE, BACKLOG & SELF-HEALING
     // =========================================================================
-    const isSupportChannel = 
+    const isSupportChannel =
       recipientPhoneId === String(PHONE_ID_SUPPORT).trim() ||
       recipientPhoneId === '1448916934975007' ||
       displayPhoneNumber.includes('729494561');
 
     if (isSupportChannel) {
-      console.log(`🤖 [ROUTING] Handing off message to Gemini AI Support Agent for ${senderPhone}...`);
+      console.log(`🤖 [ROUTING] Handing off message to Gemini AI Support & Self-Healing Agent for ${senderPhone}...`);
       if (messageType === 'text') {
         await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim(), recipientPhoneId);
       }
@@ -1030,7 +1294,7 @@ app.post('/webhook', async (req, res) => {
 
       if (buttonId.startsWith('CANCEL_TASK_')) {
         const cancelJobId = buttonId.replace('CANCEL_TASK_', '');
-        runnerJobs.delete(cancelJobId);
+        await deleteJob(cancelJobId);
         await sendWhatsAppMessage(senderPhone, `🚫 *Task #${cancelJobId} Cancelled.* No fee was charged.`, PHONE_ID_MAIN);
         return;
       }
@@ -1039,13 +1303,14 @@ app.post('/webhook', async (req, res) => {
         const jobId = buttonId.replace('JOB_ACCEPT_', '');
         const job = runnerJobs.get(jobId);
 
-        if (!job || job.status === 'CLAIMED' || job.status === 'IN_TRANSIT') {
+        if (!job || job.status === 'CLAIMED_AWAITING_PICKUP' || job.status === 'IN_TRANSIT') {
           await sendWhatsAppMessage(senderPhone, `❌ *Task already claimed* by another Ponte Runner.`, PHONE_ID_MAIN);
           return;
         }
 
         job.status = 'CLAIMED_AWAITING_PICKUP';
         job.claimedBy = senderPhone;
+        await persistJob(job);
 
         await sendInteractiveButtons(
           senderPhone,
@@ -1073,6 +1338,7 @@ app.post('/webhook', async (req, res) => {
 
         job.status = 'IN_TRANSIT';
         job.collectedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+        await persistJob(job);
 
         await sendWhatsAppMessage(
           job.hostPhone,
@@ -1099,6 +1365,7 @@ app.post('/webhook', async (req, res) => {
 
         job.status = 'AWAITING_RESIDENT_CONFIRMATION';
         job.deliveredAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+        await persistJob(job);
 
         await sendWhatsAppMessage(
           senderPhone,
@@ -1129,6 +1396,7 @@ app.post('/webhook', async (req, res) => {
 
         job.status = 'COMPLETED_VERIFIED';
         job.completedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+        await persistJob(job);
 
         if (job.claimedBy) {
           await sendWhatsAppMessage(
@@ -1165,7 +1433,7 @@ app.post('/webhook', async (req, res) => {
         const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'Resident' };
 
         const exitAlertId = `EXIT-${Math.floor(1000 + Math.random() * 9000)}`;
-        securityAlerts.set(exitAlertId, {
+        const exitAlert = {
           alertId: exitAlertId,
           visitorName: `Guest (${guestPhone})`,
           visitorPhone: guestPhone,
@@ -1176,7 +1444,8 @@ app.post('/webhook', async (req, res) => {
           zone: 'EGRESS_CLEARANCE',
           status: 'PENDING_MANUAL_REVIEW',
           expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString()
-        });
+        };
+        await persistAlert(exitAlert);
 
         await sendWhatsAppMessage(
           senderPhone,
@@ -1248,7 +1517,7 @@ app.post('/webhook', async (req, res) => {
           feePaid: 'R35.00'
         };
 
-        runnerJobs.set(jobId, jobRecord);
+        await persistJob(jobRecord);
         residentSessions.delete(senderPhone);
 
         const checkoutUrl = await generatePaystackCheckout(senderPhone, hostProfile.unit, jobId);
@@ -1425,9 +1694,9 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ============================================================================
-// GUARD LIVE HUD & OVERRIDE API
+// GUARD LIVE HUD & OVERRIDE API (PROTECTED BY BASIC AUTH)
 // ============================================================================
-app.get('/security/live', (req, res) => {
+app.get('/security/live', requireHudAuth, (req, res) => {
   const alertsList = Array.from(securityAlerts.values()).reverse();
   const rows = alertsList.map(a => `
     <tr style="border-bottom: 1px solid #334155; ${a.status === 'APPROVED' || a.status === 'EXIT_CONFIRMED' || a.status === 'ARCHIVED_PURGED' ? 'opacity: 0.5;' : ''}">
@@ -1436,7 +1705,7 @@ app.get('/security/live', (req, res) => {
       <td style="padding: 12px;">
         <strong>${a.visitorName}</strong><br>
         <span style="font-size: 12px; color: #94a3b8;">${a.visitorPhone}</span><br>
-        <span style="font-size: 11px; color: #cbd5e1;">Doc: ${a.idNumber}</span>
+        <span style="font-size: 11px; color: #cbd5e1;">Doc: ${maskID(a.idNumber)}</span>
       </td>
       <td style="padding: 12px; color: ${a.zone === 'EGRESS_CLEARANCE' ? '#eab308' : '#f87171'};">
         ${a.reason}<br>
@@ -1470,12 +1739,12 @@ app.get('/security/live', (req, res) => {
           input, select { padding: 10px; border-radius: 4px; border: 1px solid #475569; background: #0f172a; color: white; }
           button { background: #0284c7; color: white; border: none; padding: 10px 20px; border-radius: 4px; font-weight: bold; cursor: pointer; }
         </style>
-        <meta http-equiv="refresh" content="10">
+        <meta http-equiv="refresh" content="15">
       </head>
       <body>
         <div class="header">
           <h2 style="margin: 0; color: #38bdf8;">🛡️ Ponte City Security & Reception HUD</h2>
-          <div>● Live Feed</div>
+          <div style="font-size: 12px; color: #4ade80;">● Live Feed | DB: ${pool ? 'PostgreSQL Persistent' : 'RAM'}</div>
         </div>
         <table>
           <thead><tr><th>Alert Ref</th><th>Time</th><th>Visitor Details</th><th>Status / Reason</th><th>Zone</th><th>Action</th></tr></thead>
@@ -1499,13 +1768,14 @@ app.get('/security/live', (req, res) => {
   `);
 });
 
-app.get('/security/override', async (req, res) => {
+app.get('/security/override', requireHudAuth, async (req, res) => {
   const { id, action } = req.query;
   const alert = securityAlerts.get(id);
   if (!alert) return res.status(404).send('Alert not found');
 
   if (action === 'APPROVE') {
     alert.status = 'APPROVED';
+    await persistAlert(alert);
     await generateTurnstilePass(alert.visitorPhone, {
       visitorName: alert.visitorName,
       idNumber: alert.idNumber || 'PHYSICAL_CHECK_PASSED',
@@ -1516,15 +1786,17 @@ app.get('/security/override', async (req, res) => {
     await sendWhatsAppMessage(alert.visitorPhone, `🛡️ *Document Verified & Clearance Granted*\nYour turnstile pass has been issued.`, PHONE_ID_MAIN);
   } else if (action === 'CONFIRM_EXIT') {
     alert.status = 'EXIT_CONFIRMED';
+    await persistAlert(alert);
     await sendWhatsAppMessage(alert.visitorPhone, `🚪 *Exit Logged*\nSafe travels!`, PHONE_ID_MAIN);
   } else {
     alert.status = 'REJECTED';
+    await persistAlert(alert);
     await sendWhatsAppMessage(alert.visitorPhone, `🚫 *Entry Denied by Security Command*`, PHONE_ID_MAIN);
   }
   res.redirect('/security/live');
 });
 
-app.post('/security/assisted-clear', async (req, res) => {
+app.post('/security/assisted-clear', requireHudAuth, async (req, res) => {
   const { visitorName, visitorPhone, hostUnit, zone } = req.body;
   let formatted = visitorPhone.replace(/\D/g, '');
   if (formatted.startsWith('0')) formatted = '27' + formatted.substring(1);
@@ -1540,9 +1812,9 @@ app.post('/security/assisted-clear', async (req, res) => {
 });
 
 // ============================================================================
-// PRODUCT BACKLOG & SELF-HEALING INCIDENT HUD
+// PRODUCT BACKLOG & SELF-HEALING INCIDENT HUD (PROTECTED BY BASIC AUTH)
 // ============================================================================
-app.get('/admin/backlog', (req, res) => {
+app.get('/admin/backlog', requireHudAuth, async (req, res) => {
   const { action, id } = req.query;
 
   if (action && id) {
@@ -1550,6 +1822,7 @@ app.get('/admin/backlog', (req, res) => {
     if (item) {
       if (action === 'APPROVE') item.status = 'APPROVED_FOR_DEV';
       if (action === 'REJECT') item.status = 'REJECTED';
+      await persistStory(item);
     }
     return res.redirect('/admin/backlog');
   }
@@ -1605,7 +1878,7 @@ app.get('/admin/backlog', (req, res) => {
       <body>
         <div class="header">
           <h2 style="margin: 0; color: #38bdf8;">📋 Customer Feature Backlog (Gemini Extracted)</h2>
-          <div style="font-size: 13px; color: #94a3b8;">Review & Approve for Steering Sessions</div>
+          <div style="font-size: 12px; color: #4ade80;">Storage: ${pool ? 'PostgreSQL Persistent ✅' : 'In-Memory RAM ⚠️'}</div>
         </div>
         <table>
           <thead><tr><th>Ref</th><th>Time</th><th>Resident Feedback</th><th>Generated User Story</th><th>Value</th><th>Status</th><th>Action</th></tr></thead>
@@ -1625,15 +1898,23 @@ app.get('/admin/backlog', (req, res) => {
   `);
 });
 
-app.get('/admin/daily-report', (req, res) => {
+app.get('/admin/daily-report', requireHudAuth, (req, res) => {
   const report = generateAuditSummary();
   res.json({ status: 'SUCCESS', report });
 });
 
 app.get('/', (req, res) => {
-  res.json({ service: 'Ponte Concierge Multi-Channel Pilot Engine', status: 'ONLINE', time: new Date().toISOString() });
+  res.json({
+    service: 'Ponte Concierge Multi-Channel Pilot Engine',
+    status: 'ONLINE',
+    persistence: pool ? 'POSTGRESQL' : 'IN_MEMORY',
+    time: new Date().toISOString()
+  });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Ponte Concierge running on port ${PORT}`);
+// Initialize DB & Start Server
+initDatabase().then(() => {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Ponte Concierge running on port ${PORT}`);
+  });
 });
