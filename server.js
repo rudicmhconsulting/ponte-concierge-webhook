@@ -438,7 +438,6 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     const allRunners = Array.from(userProfiles.entries()).filter(([, p]) => p.role === 'RUNNER');
     const activeRunners = allRunners.filter(([, p]) => p.active !== false);
 
-    // Never auto-enroll ADMIN_REPORT_PHONE as a runner; simply list current roster
     if (senderPhone === ADMIN_REPORT_PHONE) {
       const rosterSummary = activeRunners
         .map(([ph, p], i) => `${i + 1}. ${p.fullName} (${ph})`)
@@ -608,7 +607,7 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     };
   }
 
-  // 5. OPS FAULT: Active Runner Delay / Stalled Errand (Explicit late/stalled report only)
+  // 5. OPS FAULT: Active Runner Delay / Stalled Errand
   const userJobs = Array.from(runnerJobs.values()).filter(
     (j) => j.hostPhone === senderPhone && j.status !== 'COMPLETED_VERIFIED'
   );
@@ -1935,7 +1934,6 @@ app.post('/webhook', async (req, res) => {
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
-      // Always allow "menu" or "cancel" to break out of any active input session cleanly
       if (['register', 'start', 'hi', 'hello', 'menu', 'cancel'].includes(cleanText)) {
         residentSessions.delete(senderPhone);
         await sendMainRoleMenu(senderPhone);
@@ -1980,7 +1978,6 @@ app.post('/webhook', async (req, res) => {
           return;
         }
 
-        // Auto-enroll immediately in PostgreSQL on QR/status check + prompt for full name
         const newRunner = {
           role: 'RUNNER',
           verified: true,
@@ -2012,6 +2009,34 @@ app.post('/webhook', async (req, res) => {
           await sendMainRoleMenu(target);
         } else {
           await sendWhatsAppMessage(senderPhone, `⚠️ No pending profile found for ${target}.`, PHONE_ID_MAIN);
+        }
+        return;
+      }
+
+      // Admin shortcut: "set resident 27715720458 5302 RC Janse van Rensburg"
+      if (senderPhone === ADMIN_REPORT_PHONE && lowerText.startsWith('set resident ')) {
+        const rest = rawText.slice('set resident '.length).trim();
+        const parts = rest.split(/\s+/);
+        let target = (parts[0] || '').replace(/\D/g, '');
+        if (target.startsWith('0')) target = '27' + target.substring(1);
+        const unit = (parts[1] || '5302').toUpperCase();
+        const fullName = parts.slice(2).join(' ') || 'RC Janse van Rensburg';
+
+        if (target) {
+          const updatedResident = {
+            role: 'RESIDENT',
+            verified: true,
+            registeredAt: userProfiles.get(target)?.registeredAt || new Date().toISOString(),
+            unit,
+            fullName
+          };
+          await persistProfile(target, updatedResident);
+          await sendWhatsAppMessage(
+            senderPhone,
+            `✅ *Updated Resident:* ${fullName} — *Unit ${unit}* (${target}) saved to PostgreSQL.`,
+            PHONE_ID_MAIN
+          );
+          await sendMainRoleMenu(target);
         }
         return;
       }
