@@ -17,8 +17,8 @@ const HUD_PASSWORD = process.env.HUD_PASSWORD || 'ponte2026';
 // ============================================================================
 // DUAL-LINE WABA IDENTIFIERS (Ponte Concierges WABA 1799638264570073)
 // ============================================================================
-const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Ops / Passes / Errands)
-const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448916934975007'; // 072 949 4561 (AI Support & Self-Healing)
+const PHONE_ID_MAIN = process.env.PHONE_NUMBER_ID_MAIN || '1358165517385065';       // 081 097 3478 (Unified Main + Support)
+const PHONE_ID_SUPPORT = process.env.PHONE_NUMBER_ID_SUPPORT || '1448916934975007'; // 072 949 4561 (Direct Support Line)
 
 // Operational Hotline & Admin Phones
 const ADMIN_REPORT_PHONE = '27715720458';
@@ -102,7 +102,6 @@ async function initDatabase() {
       );
     `);
 
-    // Rehydrate user profiles from DB (and persist seed profiles if not yet stored)
     const profilesRes = await pool.query('SELECT phone, payload FROM ponte_user_profiles');
     for (const row of profilesRes.rows) {
       userProfiles.set(row.phone, row.payload);
@@ -703,43 +702,61 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
 }
 
 // ============================================================================
-// DETERMINISTIC FAULT FAST-PATH + GEMINI 2.5 FLASH SUPPORT & BACKLOG AGENT
+// DETERMINISTIC + EXPLICIT-MODE SUPPORT, SELF-HEALING & BACKLOG AGENT
+// forcedMode: 'GENERAL' | 'ISSUE' | 'IMPROVE' | null (auto-detect)
 // ============================================================================
-async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromPhoneId = PHONE_ID_SUPPORT) {
+async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromPhoneId = PHONE_ID_MAIN, forcedMode = null) {
   const lowerMsg = userMessage.toLowerCase();
 
-  // 1. DETERMINISTIC FAST-PATH FOR SYSTEM & OPS FAULTS
-  const faultKeywords = [
-    'audit', 'report', '20:00', 'schedule', 'hud', 'backlog', 'status',
-    'db', 'database', 'memory', 'late', 'runner', 'broadcast', 'roster',
-    'stuck', 'delay', 'gate', 'pass', 'broken', 'error', 'not running',
-    'not working', 'not getting', 'not receiving', 'issue', 'verify', 'resident'
-  ];
-
-  if (faultKeywords.some((kw) => lowerMsg.includes(kw))) {
+  // EXPLICIT MODE 1: User tapped "Report an Issue"
+  if (forcedMode === 'ISSUE') {
     const remediation = await diagnoseAndRemediateOperationalIssue(senderPhone, userMessage);
     await sendWhatsAppMessage(senderPhone, remediation.message, replyFromPhoneId);
     return;
   }
 
-  // 2. GEMINI AI TRIAGE FOR FEATURE REQUESTS & GENERAL SUPPORT
+  // AUTO-DETECT FAULTS (when not forced to GENERAL or IMPROVE)
+  if (!forcedMode) {
+    const faultKeywords = [
+      'audit', 'report', '20:00', 'schedule', 'hud', 'backlog', 'status',
+      'db', 'database', 'memory', 'late', 'runner', 'broadcast', 'roster',
+      'stuck', 'delay', 'gate', 'pass', 'broken', 'error', 'not running',
+      'not working', 'not getting', 'not receiving', 'issue', 'verify', 'resident'
+    ];
+
+    if (faultKeywords.some((kw) => lowerMsg.includes(kw))) {
+      const remediation = await diagnoseAndRemediateOperationalIssue(senderPhone, userMessage);
+      await sendWhatsAppMessage(senderPhone, remediation.message, replyFromPhoneId);
+      return;
+    }
+  }
+
+  // GEMINI 2.5 FLASH TRIAGE (Handles General Assistance & Suggested Improvements)
   try {
+    const modeDirective =
+      forcedMode === 'IMPROVE'
+        ? 'The user explicitly selected "Suggest Improvement". Treat this message as a FEATURE_REQUEST and write a crisp Agile User Story.'
+        : forcedMode === 'GENERAL'
+          ? 'The user explicitly selected "General Assistance". Treat this as a SUPPORT_QUERY and answer clearly.'
+          : 'Classify intent as either "FEATURE_REQUEST" (any suggestion, idea, or enhancement) or "SUPPORT_QUERY" (general question).';
+
     const prompt = `
-You are the AI Concierge Support & Autonomous Operations Agent for "Ponte Concierge" at Ponte City, Johannesburg.
-A resident, runner, or visitor texted our dedicated support line (+27 72 949 4561):
-"${userMessage}"
+You are the AI Concierge Support & Product Agent for "Ponte Concierge" at Ponte City, Johannesburg.
+User message: "${userMessage}"
 
-Key Operational Context:
-- Errand Service: R35 promo flat fee paid on WhatsApp via Paystack. Runners earn R25 on dual confirmation.
-- Visitor Clearance: 100% digital on WhatsApp, optical QR passes valid for 24 hours.
-- Front Desk / Reception Hours: 07:00 to 16:00, Monday to Friday. Security desk is manned 24/7.
+Operational Facts:
+- Errand Service: R35 promo flat fee paid via Paystack on WhatsApp. Runners earn R25 on resident handover confirmation.
+- Visitor Clearance: 100% digital on WhatsApp; optical QR passes valid for 24 hours with multi-entry.
+- Reception Hours: 07:00 to 16:00 Mon-Fri; Security desk manned 24/7.
+- Main Menu: Users can reply "menu" anytime for 1-tap buttons (Invite Visitor, Book Runner, Help & Support).
 
-Instructions:
-1. Classify intent:
-   - "FEATURE_REQUEST": Any suggestion, feedback, idea, or capability not yet automated (e.g. recurring daily bread/milk deliveries, off-site mall errands, car wash).
-   - "SUPPORT_QUERY": General questions (reception hours, how it works, pricing, rules).
-2. If FEATURE_REQUEST: Formulate a clean Agile User Story ("As a [user], I want [feature] so that [benefit]") with Business Value ("High", "Medium", "Low").
-3. Reply concisely and warmly (max 3 sentences) suitable for WhatsApp.
+${modeDirective}
+
+Output JSON with:
+- category: "FEATURE_REQUEST" or "SUPPORT_QUERY"
+- replyText: Concise, warm WhatsApp reply (max 3 sentences). If FEATURE_REQUEST, thank them and confirm it was added to the product backlog for steering review.
+- userStory: Agile User Story ("As a [user], I want [feature] so that [benefit]") if FEATURE_REQUEST, else null.
+- businessValue: "High", "Medium", or "Low" if FEATURE_REQUEST, else null.
 `;
 
     const response = await ai.models.generateContent({
@@ -763,7 +780,7 @@ Instructions:
     const parsed = JSON.parse(response.text.trim());
     await sendWhatsAppMessage(senderPhone, parsed.replyText, replyFromPhoneId);
 
-    if (parsed.category === 'FEATURE_REQUEST' && parsed.userStory) {
+    if ((forcedMode === 'IMPROVE' || parsed.category === 'FEATURE_REQUEST') && parsed.userStory) {
       const storyItem = {
         id: `STORY-${Date.now().toString().slice(-4)}`,
         rawFeedback: userMessage,
@@ -789,9 +806,29 @@ Instructions:
     }
   } catch (err) {
     console.error('❌ AI Support Agent Error:', err.message);
+    if (forcedMode === 'IMPROVE') {
+      const storyItem = {
+        id: `STORY-${Date.now().toString().slice(-4)}`,
+        rawFeedback: userMessage,
+        userStory: `As a Ponte user, I want "${userMessage}" so that building operations are smoother.`,
+        businessValue: 'Medium',
+        senderPhone: senderPhone,
+        status: 'PENDING_APPROVAL',
+        submittedAt: new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
+        submittedDate: new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' })
+      };
+      await persistStory(storyItem);
+      await sendWhatsAppMessage(
+        senderPhone,
+        `💡 Thank you! Your improvement suggestion [${storyItem.id}] has been saved to our product backlog for next week's refinement session.`,
+        replyFromPhoneId
+      );
+      return;
+    }
+
     await sendWhatsAppMessage(
       senderPhone,
-      `Hello! Ponte Concierge Support has received your message. Our operational team will review it shortly.`,
+      `Hello! Ponte Concierge Support has received your message. Reply *menu* anytime to return to the main buttons.`,
       replyFromPhoneId
     );
   }
@@ -1194,13 +1231,11 @@ function generateAuditSummary() {
   const platformMargin = completedJobs.length * 10.00;
   const communityRebate = completedJobs.length * 0.50;
 
-  // Directory & Onboarding Health
   const profiles = Array.from(userProfiles.values());
   const activeRunners = profiles.filter(p => p.role === 'RUNNER' && p.active !== false);
   const verifiedResidents = profiles.filter(p => p.role === 'RESIDENT' && p.verified);
   const pendingResidents = profiles.filter(p => p.role === 'RESIDENT' && !p.verified);
 
-  // Self-Healing & Backlog Telemetry (Today + Open Queue)
   const todaysIncidents = systemIncidentLog.filter(i => i.timestamp && i.timestamp.startsWith(todayStr));
   const autoResolvedToday = todaysIncidents.filter(i => i.status === 'AUTO_RESOLVED');
   const escalatedToday = todaysIncidents.filter(i => i.status === 'ESCALATED');
@@ -1335,7 +1370,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ============================================================================
-// INBOUND MESSAGE PROCESSOR (POST) - DUAL-CHANNEL ROUTING
+// INBOUND MESSAGE PROCESSOR (POST) - UNIFIED BUTTON UX + SUPPORT SUB-MENU
 // ============================================================================
 app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
@@ -1364,7 +1399,7 @@ app.post('/webhook', async (req, res) => {
     console.log(`📥 [INBOUND] From: ${senderPhone} | To Phone ID: "${recipientPhoneId}" | Display No: "${displayPhoneNumber}" | Type: ${messageType}`);
 
     // =========================================================================
-    // CHANNEL A: 072 SUPPORT LINE -> DETERMINISTIC FAST-PATH + GEMINI 2.5 FLASH
+    // CHANNEL A: 072 DIRECT SUPPORT LINE -> AUTO-TRIAGE + SELF-HEALING
     // =========================================================================
     const isSupportChannel =
       recipientPhoneId === String(PHONE_ID_SUPPORT).trim() ||
@@ -1372,44 +1407,187 @@ app.post('/webhook', async (req, res) => {
       displayPhoneNumber.includes('729494561');
 
     if (isSupportChannel) {
-      console.log(`🤖 [ROUTING] Handing off message to Support & Self-Healing Agent for ${senderPhone}...`);
+      console.log(`🤖 [ROUTING] Direct Support Line message from ${senderPhone}...`);
       if (messageType === 'text') {
-        await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim(), recipientPhoneId);
+        await handleSupportAndBacklogAgent(senderPhone, message.text.body.trim(), recipientPhoneId, null);
       }
       return;
     }
 
     // =========================================================================
-    // CHANNEL B: 081 MAIN ENGINE -> SELF-REGISTRATION, OCR, DISPATCH
+    // CHANNEL B: 081 MAIN ENGINE -> 100% INTERACTIVE BUTTONS + 3-WAY SUPPORT
     // =========================================================================
-    console.log(`🏢 [ROUTING] Handing off message to Ponte Concierge Main Engine for ${senderPhone}...`);
+    async function sendMainRoleMenu(phone) {
+      const existing = userProfiles.get(phone);
+
+      if (!existing) {
+        await sendInteractiveButtons(
+          phone,
+          'PONTE CONCIERGE',
+          'Welcome to Ponte City! Tap an option below to get started:',
+          [
+            { id: 'ROLE_RESIDENT', title: 'Ponte Resident 🏠' },
+            { id: 'ROLE_RUNNER', title: 'Ponte Runner 🏃' },
+            { id: 'OPEN_SUPPORT', title: 'Help & Support 🩺' }
+          ],
+          'Visitors: Passes are issued by your host.',
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      if (existing.role === 'RESIDENT') {
+        const statusBadge = existing.verified ? '✅ Verified' : '⏳ Pending Unit Check';
+        await sendInteractiveButtons(
+          phone,
+          `UNIT ${existing.unit} · CONCIERGE`,
+          `Welcome back ${existing.fullName} [${statusBadge}].\n\nWhat would you like to do?`,
+          [
+            { id: 'MENU_VISITOR', title: 'Invite Visitor 🎟️' },
+            { id: 'MENU_RUNNER', title: 'Book Runner 🛒' },
+            { id: 'OPEN_SUPPORT', title: 'Help & Support 🩺' }
+          ],
+          'Tip: Reply "retail" for Parking/Retail pass',
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      if (existing.role === 'RUNNER') {
+        await sendInteractiveButtons(
+          phone,
+          'PONTE RUNNER ROSTER',
+          `Welcome back ${existing.fullName}! You are active on standby for task dispatches.`,
+          [
+            { id: 'RUNNER_CHECK_ROSTER', title: 'Check Open Jobs 📋' },
+            { id: 'OPEN_SUPPORT', title: 'Help & Support 🩺' }
+          ],
+          '',
+          PHONE_ID_MAIN
+        );
+      }
+    }
 
     if (messageType === 'interactive' && message.interactive.type === 'button_reply') {
       const buttonId = message.interactive.button_reply.id;
 
-      // 1. STANDALONE RESIDENT ONBOARDING (Captures real Name + Unit #)
+      // 0A. HELP & SUPPORT 3-OPTION SUB-MENU
+      if (buttonId === 'OPEN_SUPPORT') {
+        await sendInteractiveButtons(
+          senderPhone,
+          'HELP & SUPPORT',
+          'How can Ponte Concierge assist you today? Choose an option below:',
+          [
+            { id: 'SUP_MODE_GENERAL', title: 'General Assistance' },
+            { id: 'SUP_MODE_ISSUE', title: 'Report an Issue 🚨' },
+            { id: 'SUP_MODE_IMPROVE', title: 'Suggest Improvement' }
+          ],
+          'Reply "menu" anytime to go back',
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      // 0B. SUPPORT SUB-MENU SELECTIONS
+      if (buttonId === 'SUP_MODE_GENERAL') {
+        residentSessions.set(senderPhone, { step: 'AWAITING_SUPPORT_INPUT', supportMode: 'GENERAL' });
+        await sendWhatsAppMessage(
+          senderPhone,
+          `💬 *General Assistance*\n\nAsk me anything about Ponte Concierge—reception hours, visitor passes, runner pricing, or how the service works:`,
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      if (buttonId === 'SUP_MODE_ISSUE') {
+        residentSessions.set(senderPhone, { step: 'AWAITING_SUPPORT_INPUT', supportMode: 'ISSUE' });
+        await sendWhatsAppMessage(
+          senderPhone,
+          `🚨 *Report an Operational Issue*\n\nDescribe the problem (e.g., delayed runner, missing broadcast, gate pass issue, or audit report) and our self-healing engine will investigate immediately:`,
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      if (buttonId === 'SUP_MODE_IMPROVE') {
+        residentSessions.set(senderPhone, { step: 'AWAITING_SUPPORT_INPUT', supportMode: 'IMPROVE' });
+        await sendWhatsAppMessage(
+          senderPhone,
+          `💡 *Suggest an Improvement*\n\nShare your idea or feature request—our AI Product Agent will format it into a user story for next week's refinement session:`,
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      if (buttonId === 'RUNNER_CHECK_ROSTER') {
+        const remediation = await diagnoseAndRemediateOperationalIssue(senderPhone, 'check runner roster');
+        await sendWhatsAppMessage(senderPhone, remediation.message, PHONE_ID_MAIN);
+        return;
+      }
+
+      // 1. STANDALONE RESIDENT ONBOARDING
       if (buttonId === 'ROLE_RESIDENT') {
         residentSessions.set(senderPhone, { step: 'AWAITING_RESIDENT_ONBOARDING' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Ponte Resident Registration*\n\nPlease reply with your *Full Name* and *Unit Number* separated by a comma:\n*Example:* Thabo Mokoena, 3204`,
+          `🏠 *Ponte Resident Registration*\n\nReply with your *Full Name* and *Unit Number* separated by a comma:\n*Example:* Thabo Mokoena, 3204`,
           PHONE_ID_MAIN
         );
         return;
       }
 
-      // 2. STANDALONE RUNNER ONBOARDING (Captures real Name & persists to PostgreSQL)
+      // 2. STANDALONE RUNNER ONBOARDING
       if (buttonId === 'ROLE_RUNNER') {
         residentSessions.set(senderPhone, { step: 'AWAITING_RUNNER_ONBOARDING' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏃 *Ponte Runner Registration*\n\nPlease reply with your *Full Name* (and optional Unit #):\n*Example:* Sipho Ndlovu, Unit 1408`,
+          `🏃 *Ponte Runner Registration*\n\nReply with your *Full Name* (and optional Unit #):\n*Example:* Sipho Ndlovu, Unit 1408`,
           PHONE_ID_MAIN
         );
         return;
       }
 
-      // 3. ADMIN 1-TAP RESIDENT VERIFICATION BUTTONS
+      // 3. MAIN MENU BUTTONS FOR RESIDENT ACTIONS
+      if (buttonId === 'MENU_VISITOR') {
+        const existing = userProfiles.get(senderPhone);
+        if (!existing || existing.role !== 'RESIDENT') {
+          residentSessions.set(senderPhone, { step: 'AWAITING_RESIDENT_ONBOARDING' });
+          await sendWhatsAppMessage(senderPhone, `🏠 Reply with your *Full Name* and *Unit Number* separated by a comma (e.g., Thabo Mokoena, 3204):`, PHONE_ID_MAIN);
+          return;
+        }
+        if (!existing.verified) {
+          await sendWhatsAppMessage(
+            senderPhone,
+            `⏳ *Unit Verification Pending*\n\nYour profile (${existing.fullName}, Unit ${existing.unit}) is awaiting Reception/Admin confirmation before issuing visitor passes. You can still tap *Book Runner* immediately!`,
+            PHONE_ID_MAIN
+          );
+          return;
+        }
+        residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
+        await sendWhatsAppMessage(
+          senderPhone,
+          `👥 *Ponte Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`,
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      if (buttonId === 'MENU_RUNNER') {
+        await sendInteractiveButtons(
+          senderPhone,
+          'REQUEST A RUNNER',
+          'Select the runner service you require:',
+          [
+            { id: 'REQ_RUNNER_PARCEL', title: 'Collect Delivery 🛒' },
+            { id: 'REQ_RUNNER_ESCORT', title: 'Escort a Visitor 👥' }
+          ],
+          'Promo Rate: R35.00 per service',
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      // 4. ADMIN 1-TAP RESIDENT VERIFICATION BUTTONS
       if (buttonId.startsWith('VERIFY_RES_')) {
         const targetPhone = buttonId.replace('VERIFY_RES_', '');
         const profile = userProfiles.get(targetPhone);
@@ -1422,11 +1600,7 @@ app.post('/webhook', async (req, res) => {
             `✅ *Resident Verified:* ${profile.fullName} (Unit ${profile.unit} - ${targetPhone}) can now issue visitor passes.`,
             PHONE_ID_MAIN
           );
-          await sendWhatsAppMessage(
-            targetPhone,
-            `🎉 *Resident Profile Verified!*\n\nWelcome ${profile.fullName} (Unit ${profile.unit}). You now have full access to issue 24-hour visitor passes (*visitor*) and book runners (*runner*).`,
-            PHONE_ID_MAIN
-          );
+          await sendMainRoleMenu(targetPhone);
         }
         return;
       }
@@ -1735,6 +1909,13 @@ app.post('/webhook', async (req, res) => {
       const lowerText = rawText.toLowerCase();
       const cleanText = lowerText.replace(/[^\w\s]/gi, '').replace(/\s+/g, ' ').trim();
 
+      // Always allow "menu" or "cancel" to break out of any active input session cleanly
+      if (['register', 'start', 'hi', 'hello', 'menu', 'cancel'].includes(cleanText)) {
+        residentSessions.delete(senderPhone);
+        await sendMainRoleMenu(senderPhone);
+        return;
+      }
+
       if (cleanText === 'report' && senderPhone === ADMIN_REPORT_PHONE) {
         await sendDailyAuditReport();
         return;
@@ -1749,7 +1930,7 @@ app.post('/webhook', async (req, res) => {
           prof.verified = true;
           await persistProfile(target, prof);
           await sendWhatsAppMessage(senderPhone, `✅ Approved Resident ${prof.fullName} (Unit ${prof.unit} - ${target}).`, PHONE_ID_MAIN);
-          await sendWhatsAppMessage(target, `🎉 *Resident Profile Verified!* You can now issue visitor passes (*visitor*) and book runners (*runner*).`, PHONE_ID_MAIN);
+          await sendMainRoleMenu(target);
         } else {
           await sendWhatsAppMessage(senderPhone, `⚠️ No pending profile found for ${target}.`, PHONE_ID_MAIN);
         }
@@ -1757,6 +1938,14 @@ app.post('/webhook', async (req, res) => {
       }
 
       const activeResSession = residentSessions.get(senderPhone);
+
+      // HANDLE EXPLICIT 3-WAY SUPPORT INPUT (GENERAL / ISSUE / IMPROVE)
+      if (activeResSession && activeResSession.step === 'AWAITING_SUPPORT_INPUT') {
+        const mode = activeResSession.supportMode || null;
+        residentSessions.delete(senderPhone);
+        await handleSupportAndBacklogAgent(senderPhone, rawText, PHONE_ID_MAIN, mode);
+        return;
+      }
 
       // COMPLETE RESIDENT SELF-REGISTRATION
       if (activeResSession && activeResSession.step === 'AWAITING_RESIDENT_ONBOARDING') {
@@ -1770,7 +1959,7 @@ app.post('/webhook', async (req, res) => {
 
         const newResident = {
           role: 'RESIDENT',
-          verified: false, // Pending Reception/Admin 1-tap approval before issuing visitor passes
+          verified: false,
           registeredAt: new Date().toISOString(),
           unit,
           fullName
@@ -1778,11 +1967,15 @@ app.post('/webhook', async (req, res) => {
         await persistProfile(senderPhone, newResident);
         residentSessions.delete(senderPhone);
 
-        await sendWhatsAppMessage(
+        await sendInteractiveButtons(
           senderPhone,
-          `✅ *Resident Profile Saved (${fullName} — Unit ${unit})*\n\n` +
-          `• You can book *paid runner errands* (*runner*) immediately.\n` +
-          `• Your *visitor pass* privileges are queued for quick Reception/Admin unit confirmation.`,
+          'PROFILE SAVED',
+          `✅ Welcome *${fullName} (Unit ${unit})*!\n\n• You can *Book Runner* immediately.\n• *Visitor Passes* unlock as soon as Reception/Admin confirms your unit.`,
+          [
+            { id: 'MENU_RUNNER', title: 'Book Runner 🛒' },
+            { id: 'OPEN_SUPPORT', title: 'Help & Support 🩺' }
+          ],
+          '',
           PHONE_ID_MAIN
         );
 
@@ -1819,11 +2012,10 @@ app.post('/webhook', async (req, res) => {
 
         await sendWhatsAppMessage(
           senderPhone,
-          `🏃 *Runner Roster Activated — Welcome ${fullName}!*\n\nYour profile is saved permanently in our database. You will receive interactive job cards whenever residents book deliveries or escorts.`,
+          `🏃 *Runner Roster Activated — Welcome ${fullName}!*\n\nYour profile is saved permanently in PostgreSQL. You will receive interactive job cards whenever residents book deliveries or escorts.`,
           PHONE_ID_MAIN
         );
 
-        // Immediately send any open paid jobs to the newly registered runner
         const openJobs = Array.from(runnerJobs.values()).filter((j) => j.status === 'PAID_AWAITING_CLAIM');
         for (const job of openJobs) {
           await broadcastRunnerJob(job, senderPhone);
@@ -1866,42 +2058,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      if (cleanText === 'register' || cleanText === 'start' || cleanText === 'hi' || cleanText === 'hello') {
-        const existing = userProfiles.get(senderPhone);
-        if (existing) {
-          if (existing.role === 'RESIDENT') {
-            const statusBadge = existing.verified ? '✅ Verified' : '⏳ Pending Unit Approval';
-            await sendWhatsAppMessage(
-              senderPhone,
-              `👋 *Welcome back ${existing.fullName} (Unit ${existing.unit})!* [${statusBadge}]\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass`,
-              PHONE_ID_MAIN
-            );
-            return;
-          }
-          if (existing.role === 'RUNNER') {
-            await sendWhatsAppMessage(
-              senderPhone,
-              `🏃 *Welcome back ${existing.fullName}!* (Ponte Runner)\nYou are active on the persistent runner roster.`,
-              PHONE_ID_MAIN
-            );
-            return;
-          }
-        }
-
-        await sendInteractiveButtons(
-          senderPhone,
-          'PONTE CONCIERGE',
-          'Welcome to Ponte City! Please select your profile:',
-          [
-            { id: 'ROLE_RESIDENT', title: 'Ponte Resident' },
-            { id: 'ROLE_RUNNER', title: 'Ponte Runner' }
-          ],
-          'Visitors: Passes are issued by your host.',
-          PHONE_ID_MAIN
-        );
-        return;
-      }
-
       if (cleanText === 'runner' || cleanText === 'parcel' || cleanText === 'delivery') {
         const existing = userProfiles.get(senderPhone);
         if (!existing) {
@@ -1934,7 +2090,7 @@ app.post('/webhook', async (req, res) => {
           residentSessions.set(senderPhone, { step: 'AWAITING_RESIDENT_ONBOARDING' });
           await sendWhatsAppMessage(
             senderPhone,
-            `🏠 *Resident Registration Required*\n\nPlease reply with your *Full Name* and *Unit Number* separated by a comma (e.g., Thabo Mokoena, 3204):`,
+            `🏠 *Resident Registration Required*\n\nReply with your *Full Name* and *Unit Number* separated by a comma (e.g., Thabo Mokoena, 3204):`,
             PHONE_ID_MAIN
           );
           return;
@@ -1943,7 +2099,7 @@ app.post('/webhook', async (req, res) => {
         if (!existing.verified) {
           await sendWhatsAppMessage(
             senderPhone,
-            `⏳ *Unit Verification Pending*\n\nYour profile (${existing.fullName}, Unit ${existing.unit}) is awaiting quick Reception/Admin confirmation before issuing visitor passes. You can still book runners (*runner*) immediately!`,
+            `⏳ *Unit Verification Pending*\n\nYour profile (${existing.fullName}, Unit ${existing.unit}) is awaiting Reception/Admin confirmation before issuing visitor passes.`,
             PHONE_ID_MAIN
           );
           return;
@@ -2038,11 +2194,12 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      await sendWhatsAppMessage(
-        senderPhone,
-        `👋 *Ponte Concierge*\n\n• Reply *register* to set up your profile\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• For support, message +27 72 949 4561`,
-        PHONE_ID_MAIN
-      );
+      // SMART FALLBACK: Route 3+ word sentences to AI Support; show 3-button menu for anything shorter
+      if (rawText.split(/\s+/).length >= 3) {
+        await handleSupportAndBacklogAgent(senderPhone, rawText, PHONE_ID_MAIN, null);
+      } else {
+        await sendMainRoleMenu(senderPhone);
+      }
     }
   } catch (error) {
     console.error('❌ Webhook error:', error);
@@ -2152,7 +2309,7 @@ app.get('/security/verify-resident', requireHudAuth, async (req, res) => {
       profile.verified = true;
       profile.verifiedAt = new Date().toISOString();
       await persistProfile(phone, profile);
-      await sendWhatsAppMessage(phone, `🎉 *Resident Profile Verified!* Welcome ${profile.fullName} (Unit ${profile.unit}). You can now issue visitor passes (*visitor*) and book runners (*runner*).`, PHONE_ID_MAIN);
+      await sendWhatsAppMessage(phone, `🎉 *Resident Profile Verified!* Welcome ${profile.fullName} (Unit ${profile.unit}). Reply *menu* anytime for 1-tap visitor passes and runner bookings.`, PHONE_ID_MAIN);
     } else {
       userProfiles.delete(phone);
       if (pool) await pool.query('DELETE FROM ponte_user_profiles WHERE phone = $1', [phone]);
