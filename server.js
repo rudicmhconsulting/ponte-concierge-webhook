@@ -261,11 +261,29 @@ const customerBacklogQueue = [];
 const systemIncidentLog = [];
 
 // Seed Verified Admin Resident (Penthouse 5302) & Active Runners
-userProfiles.set('27715720458', { role: 'RESIDENT', verified: true, registeredAt: new Date().toISOString(), unit: '5302', fullName: 'RC Janse van Rensburg' });
+userProfiles.set('27715720458', { role: 'RESIDENT', verified: true, registeredAt: new Date().toISOString(), unit: '5302', fullName: 'Rudi van Rensburg' });
 userProfiles.set('27832778743', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Kaycee' });
 userProfiles.set('27822229285', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Vusi' });
 userProfiles.set('27688814679', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Musa' });
 userProfiles.set('27656206712', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Faith' });
+
+function getHostDetails(job) {
+  const profile = userProfiles.get(job.hostPhone);
+  return {
+    fullName: profile?.fullName || job.hostName || 'Resident',
+    unit: profile?.unit || job.unit || '5302',
+    phone: job.hostPhone
+  };
+}
+
+function getRunnerDetails(runnerPhone) {
+  if (!runnerPhone) return { fullName: 'Ponte Runner', phone: '' };
+  const profile = userProfiles.get(runnerPhone);
+  return {
+    fullName: profile?.fullName || `Runner (${runnerPhone.slice(-4)})`,
+    phone: runnerPhone
+  };
+}
 
 // ============================================================================
 // HUD BASIC AUTH GUARD (PROTECTS /admin/* & /security/*)
@@ -326,11 +344,11 @@ async function sendInteractiveButtons(recipientPhone, headerText, bodyText, butt
       type: 'interactive',
       interactive: {
         type: 'button',
-        header: headerText ? { type: 'text', text: headerText } : undefined,
+        header: headerText ? { type: 'text', text: headerText.substring(0, 60) } : undefined,
         body: { text: bodyText },
-        footer: footerText ? { text: footerText } : undefined,
+        footer: footerText ? { text: footerText.substring(0, 60) } : undefined,
         action: {
-          buttons: buttons.map((b) => ({
+          buttons: buttons.slice(0, 3).map((b) => ({
             type: 'reply',
             reply: { id: b.id, title: b.title.substring(0, 20) },
           })),
@@ -348,6 +366,46 @@ async function sendInteractiveButtons(recipientPhone, headerText, bodyText, butt
     return await res.json();
   } catch (error) {
     console.error(`❌ Error in sendInteractiveButtons:`, error.message);
+  }
+}
+
+async function sendCtaUrlButton(recipientPhone, headerText, bodyText, buttonLabel, url, footerText = '', senderPhoneId = PHONE_ID_MAIN) {
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipientPhone,
+      type: 'interactive',
+      interactive: {
+        type: 'cta_url',
+        header: headerText ? { type: 'text', text: headerText.substring(0, 60) } : undefined,
+        body: { text: bodyText },
+        footer: footerText ? { text: footerText.substring(0, 60) } : undefined,
+        action: {
+          name: 'cta_url',
+          parameters: {
+            display_text: buttonLabel.substring(0, 20),
+            url: url
+          }
+        }
+      }
+    };
+    const res = await fetch(`https://graph.facebook.com/v18.0/${senderPhoneId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const result = await res.json();
+    if (!res.ok || result.error) {
+      await sendWhatsAppMessage(recipientPhone, `${bodyText}\n\n👉 *${buttonLabel}:* ${url}`, senderPhoneId);
+    }
+    return result;
+  } catch (error) {
+    console.error(`❌ Error in sendCtaUrlButton:`, error.message);
+    await sendWhatsAppMessage(recipientPhone, `${bodyText}\n\n👉 *${buttonLabel}:* ${url}`, senderPhoneId);
   }
 }
 
@@ -375,12 +433,13 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneI
 }
 
 async function broadcastRunnerJob(job, singleRunnerPhone = null) {
+  const host = getHostDetails(job);
   const runnerAlertText =
-    `🏃 *NEW PONTE RUNNER TASK [#${job.jobId}]*\n\n` +
-    `• *Type:* ${job.taskType}\n` +
-    `• *Host:* ${job.hostName} (Unit ${job.unit}) - ${job.hostPhone}\n` +
-    `📌 *Pickup Instructions:*\n_${job.details}_\n\n` +
-    `• *Payout:* ${job.payout}`;
+    `🏃 *NEW RUNNER TASK [#${job.jobId}]*\n\n` +
+    `• *Service:* ${job.taskType}\n` +
+    `• *Resident:* ${host.fullName} · Unit *${host.unit}* (${host.phone})\n` +
+    `📌 *Pickup Details:*\n_${job.details}_\n\n` +
+    `• *Runner Payout:* ${job.payout}`;
 
   if (singleRunnerPhone) {
     await sendInteractiveButtons(
@@ -416,6 +475,83 @@ async function broadcastRunnerJob(job, singleRunnerPhone = null) {
   }
   console.log(`📣 [BROADCAST] Job #${job.jobId} sent to ${sentCount} active runner(s).`);
   return sentCount;
+}
+
+// ============================================================================
+// DELIVERY SCREENSHOT VISION / OCR EXTRACTION FOR QUICK RUNNER BOOKING
+// ============================================================================
+async function extractDeliveryDetailsFromImage(imageBuffer) {
+  try {
+    const normalized = await preprocessDocumentImage(imageBuffer, 0);
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        {
+          inlineData: {
+            mimeType: 'image/jpeg',
+            data: normalized.toString('base64')
+          }
+        },
+        `Extract delivery order details from this order/courier screenshot for a building runner.
+Return a single concise line containing vendor/courier, arrival/ETA if shown, recipient name if shown, and delivery/release PIN/OTP if shown (e.g. "Zulzi · ETA 11 min · Rudi · PIN 5666"). Keep it under 160 characters.`
+      ]
+    });
+    const extracted = (response.text || '').trim().replace(/\s+/g, ' ');
+    if (extracted) return extracted;
+  } catch (err) {
+    console.warn('⚠️ Vision extraction fallback to Tesseract:', err.message);
+  }
+
+  let worker = null;
+  try {
+    const processed = await preprocessDocumentImage(imageBuffer, 0);
+    worker = await createWorker('eng');
+    const ret = await worker.recognize(processed);
+    await worker.terminate();
+    const compact = (ret.data.text || '').replace(/\s+/g, ' ').trim().slice(0, 150);
+    return compact || 'Delivery screenshot attached (check image details)';
+  } catch {
+    if (worker) await worker.terminate();
+    return 'Delivery screenshot attached (check image details)';
+  }
+}
+
+async function createAndPromptRunnerBooking(senderPhone, taskType, detailsText, guestPhone = null, mediaId = null) {
+  const hostProfile = userProfiles.get(senderPhone) || { unit: '5302', fullName: 'Resident' };
+  const jobId = Math.floor(1000 + Math.random() * 9000).toString();
+
+  const jobRecord = {
+    jobId,
+    status: 'PENDING_PAYMENT',
+    unit: hostProfile.unit,
+    hostName: hostProfile.fullName,
+    hostPhone: senderPhone,
+    guestPhone: guestPhone || null,
+    details: detailsText,
+    mediaId: mediaId || null,
+    taskType: taskType || 'PARCEL_COLLECTION',
+    payout: 'R25.00',
+    feePaid: 'R35.00'
+  };
+
+  await persistJob(jobRecord);
+  residentSessions.delete(senderPhone);
+
+  const checkoutUrl = await generatePaystackCheckout(senderPhone, hostProfile.unit, jobId);
+
+  await sendCtaUrlButton(
+    senderPhone,
+    `CONFIRM BOOKING #${jobId}`,
+    `✨ *${hostProfile.fullName} · Unit ${hostProfile.unit}*\n\n` +
+      `• *Service:* ${jobRecord.taskType === 'PARCEL_COLLECTION' ? 'Parcel Collection 🛒' : 'Visitor Escort 👥'}\n` +
+      `• *Details:* _${detailsText}_\n` +
+      `• *Total Due:* *R35.00* (Launch Promo)\n\n` +
+      `Tap below to pay & dispatch your runner:`,
+    'Pay R35.00 💳',
+    checkoutUrl,
+    'Dispatches to runners once paid',
+    PHONE_ID_MAIN
+  );
 }
 
 // ============================================================================
@@ -953,18 +1089,18 @@ async function downloadMetaImage(imageId) {
 }
 
 // ============================================================================
-// PAYSTACK DYNAMIC CHECKOUT
+// PAYSTACK DYNAMIC CHECKOUT (FAST CHANNELS)
 // ============================================================================
 async function generatePaystackCheckout(residentPhone, unit, jobId) {
   try {
     const payload = {
-      email: `resident.unit${unit}@ponteconcierge.co.za`,
+      email: `unit${unit}@ponteconcierge.co.za`,
       amount: 3500, // R35.00
       currency: 'ZAR',
       reference: `PC-${jobId}-${Date.now().toString().slice(-4)}`,
       callback_url: `https://wa.me/27810973478`,
       split_code: PAYSTACK_SPLIT_CODE,
-      channels: ['card', 'eft', 'bank', 'qr', 'apple_pay', 'capitec_pay'],
+      channels: ['card', 'qr', 'apple_pay', 'capitec_pay'],
       metadata: {
         jobId: jobId,
         phone: residentPhone,
@@ -996,6 +1132,30 @@ async function generatePaystackCheckout(residentPhone, unit, jobId) {
     console.error('❌ Paystack Initialization Exception:', err.message);
     return FALLBACK_PAYMENT_PAGE;
   }
+}
+
+async function markJobPaidAndDispatch(job) {
+  if (!job || job.status !== 'PENDING_PAYMENT') return;
+  const host = getHostDetails(job);
+  job.unit = host.unit;
+  job.hostName = host.fullName;
+  job.status = 'PAID_AWAITING_CLAIM';
+  job.paidAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
+  await persistJob(job);
+
+  const hasPin = /\b\d{4,6}\b/.test(job.details);
+  const pinReminder = hasPin
+    ? ''
+    : `\n\n⚠️ *REMINDER:* If your courier requires a release PIN/OTP, text it to your runner once claimed.`;
+
+  await sendWhatsAppMessage(
+    job.hostPhone,
+    `✅ *Payment Confirmed (R35.00)*\n\n` +
+      `Task *#${job.jobId}* for *${host.fullName} · Unit ${host.unit}* is funded and dispatched to our runners.${pinReminder}`,
+    PHONE_ID_MAIN
+  );
+
+  await broadcastRunnerJob(job);
 }
 
 function isReceptionOpen() {
@@ -1155,25 +1315,7 @@ app.post('/paystack/webhook', async (req, res) => {
     if (!job) return;
 
     if (eventType === 'charge.success') {
-      if (job.status === 'PENDING_PAYMENT') {
-        job.status = 'PAID_AWAITING_CLAIM';
-        job.paidAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
-        await persistJob(job);
-
-        const hasPin = /\b\d{4,6}\b/.test(job.details);
-        const pinReminder = hasPin
-          ? ''
-          : `\n\n⚠️ *REMINDER:* If your courier requires a release PIN/OTP, text it to your runner once claimed.`;
-
-        await sendWhatsAppMessage(
-          job.hostPhone,
-          `✅ *Payment Confirmed (R35.00)*\n\n` +
-            `Task *#${job.jobId}* is funded and dispatched to the active runner roster.${pinReminder}`,
-          PHONE_ID_MAIN
-        );
-
-        await broadcastRunnerJob(job);
-      }
+      await markJobPaidAndDispatch(job);
       return;
     }
 
@@ -1432,7 +1574,7 @@ app.post('/webhook', async (req, res) => {
       if (!existing) {
         await sendInteractiveButtons(
           phone,
-          'PONTE CONCIERGE',
+          'PONTE CONCIERGE AT YOUR SERVICE',
           'Welcome to Ponte City! Tap an option below to get started:',
           [
             { id: 'ROLE_RESIDENT', title: 'Ponte Resident 🏠' },
@@ -1449,14 +1591,14 @@ app.post('/webhook', async (req, res) => {
         const statusBadge = existing.verified ? '✅ Verified' : '⏳ Pending Unit Check';
         await sendInteractiveButtons(
           phone,
-          `UNIT ${existing.unit} · CONCIERGE`,
-          `Welcome back ${existing.fullName} [${statusBadge}].\n\nWhat would you like to do?`,
+          'PONTE CONCIERGE AT YOUR SERVICE',
+          `Welcome back *${existing.fullName}* — we have you registered at *Unit ${existing.unit}* [${statusBadge}].\n\nWhat would you like to do?`,
           [
             { id: 'MENU_VISITOR', title: 'Invite Visitor 🎟️' },
             { id: 'MENU_RUNNER', title: 'Book Runner 🛒' },
             { id: 'OPEN_SUPPORT', title: 'Help & Support 🩺' }
           ],
-          'Tip: Reply "retail" for Parking/Retail pass',
+          'Tip: Reply "retail" (Coming Soon) · "menu" to reset',
           PHONE_ID_MAIN
         );
         return;
@@ -1465,13 +1607,13 @@ app.post('/webhook', async (req, res) => {
       if (existing.role === 'RUNNER') {
         await sendInteractiveButtons(
           phone,
-          'PONTE RUNNER ROSTER',
-          `Welcome back ${existing.fullName}! You are active on standby for task dispatches.`,
+          'PONTE RUNNER HUB',
+          `Welcome back *${existing.fullName}*! You are active on standby for task dispatches.`,
           [
             { id: 'RUNNER_CHECK_ROSTER', title: 'Check Open Jobs 📋' },
             { id: 'OPEN_SUPPORT', title: 'Help & Support 🩺' }
           ],
-          '',
+          'Reply "menu" anytime to return',
           PHONE_ID_MAIN
         );
       }
@@ -1484,7 +1626,7 @@ app.post('/webhook', async (req, res) => {
       if (buttonId === 'OPEN_SUPPORT') {
         await sendInteractiveButtons(
           senderPhone,
-          'HELP & SUPPORT',
+          'HELP & SUPPORT DESK',
           'How can Ponte Concierge assist you today? Choose an option below:',
           [
             { id: 'SUP_MODE_GENERAL', title: 'General Assistance' },
@@ -1600,13 +1742,13 @@ app.post('/webhook', async (req, res) => {
       if (buttonId === 'MENU_RUNNER') {
         await sendInteractiveButtons(
           senderPhone,
-          'REQUEST A RUNNER',
-          'Select the runner service you require:',
+          'RUNNER & CONCIERGE DISPATCH',
+          'Select the service you need—or drop an order screenshot anytime:',
           [
             { id: 'REQ_RUNNER_PARCEL', title: 'Collect Delivery 🛒' },
             { id: 'REQ_RUNNER_ESCORT', title: 'Escort a Visitor 👥' }
           ],
-          'Promo Rate: R35.00 per service',
+          'Promo Rate: R35.00 · Local Partners (Soon)',
           PHONE_ID_MAIN
         );
         return;
@@ -1676,7 +1818,7 @@ app.post('/webhook', async (req, res) => {
         });
 
         const promptText = taskType === 'PARCEL_COLLECTION'
-          ? `📝 *Delivery Details & Courier PIN:*\n\nReply with what to collect, courier company, and release PIN:\n*(e.g., "Main Gate - Checkers Sixty60 under Rudi, PIN: 4812")*`
+          ? `📝 *Delivery Details or Screenshot:*\n\nSend a *screenshot* of your delivery app OR reply with what to collect, courier, and PIN:\n*(e.g., "Main Gate - Zulzi delivery, PIN 5666")*`
           : `📝 *Escort Details:*\n\nReply with who and where to meet:\n*(e.g., "Lobby turnstiles - Thabo 0821234567")*`;
 
         await sendWhatsAppMessage(senderPhone, promptText, PHONE_ID_MAIN);
@@ -1722,10 +1864,15 @@ app.post('/webhook', async (req, res) => {
         const retryJobId = buttonId.replace('RETRY_PAY_', '');
         const retryJob = runnerJobs.get(retryJobId);
         if (retryJob) {
-          const checkoutUrl = await generatePaystackCheckout(retryJob.hostPhone, retryJob.unit, retryJob.jobId);
-          await sendWhatsAppMessage(
+          const host = getHostDetails(retryJob);
+          const checkoutUrl = await generatePaystackCheckout(retryJob.hostPhone, host.unit, retryJob.jobId);
+          await sendCtaUrlButton(
             senderPhone,
-            `💳 *Retry Payment for Task [#${retryJob.jobId}]*\n\nTap below to complete your R35.00 checkout:\n${checkoutUrl}`,
+            `CONFIRM BOOKING #${retryJob.jobId}`,
+            `💳 *Retry Payment for Task [#${retryJob.jobId}]*\n\nTap below to complete your R35.00 checkout:`,
+            'Pay R35.00 💳',
+            checkoutUrl,
+            '',
             PHONE_ID_MAIN
           );
         }
@@ -1748,6 +1895,9 @@ app.post('/webhook', async (req, res) => {
           return;
         }
 
+        const host = getHostDetails(job);
+        job.unit = host.unit;
+        job.hostName = host.fullName;
         job.status = 'CLAIMED_AWAITING_PICKUP';
         job.claimedBy = senderPhone;
         await persistJob(job);
@@ -1756,7 +1906,7 @@ app.post('/webhook', async (req, res) => {
           senderPhone,
           `TASK #${jobId} CLAIMED`,
           `• *Type:* ${job.taskType}\n` +
-          `• *Destination:* Unit ${job.unit} (${job.hostName}: ${job.hostPhone})\n` +
+          `• *Resident:* ${host.fullName} · Unit *${host.unit}* (${host.phone})\n` +
           `📌 *Details:* _${job.details}_\n\n` +
           `Meet courier/guest directly at the gate. Tap below once collected:`,
           [{ id: `JOB_COLLECTED_${jobId}`, title: 'Collected & En Route 🏃‍♂️' }],
@@ -1776,21 +1926,27 @@ app.post('/webhook', async (req, res) => {
         const job = runnerJobs.get(jobId);
         if (!job) return;
 
+        const host = getHostDetails(job);
+        const runner = getRunnerDetails(senderPhone);
+        job.unit = host.unit;
+        job.hostName = host.fullName;
         job.status = 'IN_TRANSIT';
         job.collectedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
         await persistJob(job);
 
         await sendWhatsAppMessage(
           job.hostPhone,
-          `🏃‍♂️ *Runner En Route to Your Unit!*\n\n` +
-            `Ponte Runner (${senderPhone}) has collected the parcel/guest and is heading to *Unit ${job.unit}*.`,
+          `🏃‍♂️ *Runner En Route to Unit ${host.unit}!*\n\n` +
+            `• *Resident:* ${host.fullName} · Unit *${host.unit}*\n` +
+            `• *Runner:* ${runner.fullName} (+${runner.phone})\n` +
+            `• *Task:* #${job.jobId} collected & heading up.`,
           PHONE_ID_MAIN
         );
 
         await sendInteractiveButtons(
           senderPhone,
           `TASK #${jobId} IN TRANSIT`,
-          `Proceeding to Unit ${job.unit}.\n\nTap below once you reach the resident's door:`,
+          `Heading to *${host.fullName} · Unit ${host.unit}*.\n\nTap below once you reach the resident's door:`,
           [{ id: `JOB_DELIVERED_${jobId}`, title: 'Delivered to Unit ✅' }],
           '',
           PHONE_ID_MAIN
@@ -1803,6 +1959,10 @@ app.post('/webhook', async (req, res) => {
         const job = runnerJobs.get(jobId);
         if (!job) return;
 
+        const host = getHostDetails(job);
+        const runner = getRunnerDetails(senderPhone);
+        job.unit = host.unit;
+        job.hostName = host.fullName;
         job.status = 'AWAITING_RESIDENT_CONFIRMATION';
         job.deliveredAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
         await persistJob(job);
@@ -1810,14 +1970,15 @@ app.post('/webhook', async (req, res) => {
         await sendWhatsAppMessage(
           senderPhone,
           `⏳ *Delivery Reported for Task #${jobId}*\n\n` +
-            `Waiting for resident (${job.hostName}, Unit ${job.unit}) to confirm physical handover before releasing payout.`,
+            `Waiting for *${host.fullName} (Unit ${host.unit})* to confirm handover before releasing payout.`,
           PHONE_ID_MAIN
         );
 
         await sendInteractiveButtons(
           job.hostPhone,
           'CONFIRM HANDOVER',
-          `🚪 Ponte Runner (${senderPhone}) reports completing task *#${jobId}* at your door.\n\n` +
+          `🚪 *${host.fullName} · Unit ${host.unit}*\n\n` +
+            `Runner *${runner.fullName}* (+${runner.phone}) reports completing task *#${job.jobId}* at your door.\n\n` +
             `Please confirm receipt:`,
           [
             { id: `RESIDENT_CONFIRM_${jobId}`, title: 'Confirm Receipt 👍' },
@@ -1834,6 +1995,7 @@ app.post('/webhook', async (req, res) => {
         const job = runnerJobs.get(jobId);
         if (!job) return;
 
+        const host = getHostDetails(job);
         job.status = 'COMPLETED_VERIFIED';
         job.completedAt = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
         await persistJob(job);
@@ -1842,7 +2004,7 @@ app.post('/webhook', async (req, res) => {
           await sendWhatsAppMessage(
             job.claimedBy,
             `🎉 *Task #${jobId} Verified by Resident!*\n\n` +
-              `Unit ${job.unit} confirmed safe handover. *R25.00* has been credited to your active shift balance.`,
+              `${host.fullName} (Unit ${host.unit}) confirmed safe handover. *R25.00* has been credited to your active shift balance.`,
             PHONE_ID_MAIN
           );
         }
@@ -1870,7 +2032,7 @@ app.post('/webhook', async (req, res) => {
 
       if (buttonId.startsWith('AUTH_EXIT_')) {
         const guestPhone = buttonId.replace('AUTH_EXIT_', '');
-        const hostProfile = userProfiles.get(senderPhone) || { unit: 'Unknown', fullName: 'Resident' };
+        const hostProfile = userProfiles.get(senderPhone) || { unit: '5302', fullName: 'Resident' };
 
         const exitAlertId = `EXIT-${Math.floor(1000 + Math.random() * 9000)}`;
         const exitAlert = {
@@ -1902,11 +2064,33 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    // IMAGE UPLOADS
+    // IMAGE UPLOADS (DELIVERY SCREENSHOT OR VISITOR ID)
     if (messageType === 'image') {
+      const imageId = message.image.id;
+
+      // 1. Delivery / Runner Note screenshot during AWAITING_RUNNER_NOTE
+      const activeResSession = residentSessions.get(senderPhone);
+      if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_NOTE') {
+        await sendWhatsAppMessage(senderPhone, '📸 *Reading your delivery screenshot...*', PHONE_ID_MAIN);
+        const imageBuffer = await downloadMetaImage(imageId);
+        if (!imageBuffer) {
+          await sendWhatsAppMessage(senderPhone, '⚠️ Could not load that screenshot. Please type the delivery details or try again.', PHONE_ID_MAIN);
+          return;
+        }
+        const extracted = await extractDeliveryDetailsFromImage(imageBuffer);
+        await createAndPromptRunnerBooking(
+          senderPhone,
+          activeResSession.taskType || 'PARCEL_COLLECTION',
+          extracted,
+          activeResSession.guestPhone || null,
+          imageId
+        );
+        return;
+      }
+
+      // 2. Visitor ID document during AWAITING_DOC_IMAGE
       const visitorSession = visitorSessions.get(senderPhone);
       if (visitorSession && visitorSession.step === 'AWAITING_DOC_IMAGE') {
-        const imageId = message.image.id;
         await sendWhatsAppMessage(senderPhone, '🔎 *Analyzing Document Image...*', PHONE_ID_MAIN);
 
         const imageBuffer = await downloadMetaImage(imageId);
@@ -1942,6 +2126,19 @@ app.post('/webhook', async (req, res) => {
 
       if (cleanText === 'report' && senderPhone === ADMIN_REPORT_PHONE) {
         await sendDailyAuditReport();
+        return;
+      }
+
+      // Admin UAT shortcut: "confirm pay <jobId>"
+      if (senderPhone === ADMIN_REPORT_PHONE && lowerText.startsWith('confirm pay ')) {
+        const targetJobId = lowerText.replace('confirm pay ', '').trim();
+        const targetJob = runnerJobs.get(targetJobId);
+        if (targetJob) {
+          await markJobPaidAndDispatch(targetJob);
+          await sendWhatsAppMessage(senderPhone, `⚡ Marked Task #${targetJobId} as PAID and dispatched to runners.`, PHONE_ID_MAIN);
+        } else {
+          await sendWhatsAppMessage(senderPhone, `⚠️ Task #${targetJobId} not found.`, PHONE_ID_MAIN);
+        }
         return;
       }
 
@@ -2013,14 +2210,14 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // Admin shortcut: "set resident 27715720458 5302 RC Janse van Rensburg"
+      // Admin shortcut: "set resident 27715720458 5302 Rudi van Rensburg"
       if (senderPhone === ADMIN_REPORT_PHONE && lowerText.startsWith('set resident ')) {
         const rest = rawText.slice('set resident '.length).trim();
         const parts = rest.split(/\s+/);
         let target = (parts[0] || '').replace(/\D/g, '');
         if (target.startsWith('0')) target = '27' + target.substring(1);
         const unit = (parts[1] || '5302').toUpperCase();
-        const fullName = parts.slice(2).join(' ') || 'RC Janse van Rensburg';
+        const fullName = parts.slice(2).join(' ') || 'Rudi van Rensburg';
 
         if (target) {
           const updatedResident = {
@@ -2043,7 +2240,6 @@ app.post('/webhook', async (req, res) => {
 
       const activeResSession = residentSessions.get(senderPhone);
 
-      // HANDLE EXPLICIT 3-WAY SUPPORT INPUT (GENERAL / ISSUE / IMPROVE)
       if (activeResSession && activeResSession.step === 'AWAITING_SUPPORT_INPUT') {
         const mode = activeResSession.supportMode || null;
         residentSessions.delete(senderPhone);
@@ -2051,7 +2247,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // COMPLETE RESIDENT SELF-REGISTRATION
       if (activeResSession && activeResSession.step === 'AWAITING_RESIDENT_ONBOARDING') {
         const parts = rawText.split(',');
         if (parts.length < 2) {
@@ -2097,7 +2292,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // UPDATE RUNNER DISPLAY NAME AFTER INSTANT ROSTER ACTIVATION
       if (activeResSession && (activeResSession.step === 'AWAITING_RUNNER_ONBOARDING' || activeResSession.step === 'AWAITING_RUNNER_NAME_UPDATE')) {
         const parts = rawText.split(',');
         const fullName = parts[0].trim();
@@ -2128,36 +2322,12 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_NOTE') {
-        const hostProfile = userProfiles.get(senderPhone) || { unit: 'UNVERIFIED', fullName: 'Resident' };
-        const jobId = Math.floor(1000 + Math.random() * 9000).toString();
-
-        const jobRecord = {
-          jobId,
-          status: 'PENDING_PAYMENT',
-          unit: hostProfile.unit,
-          hostName: hostProfile.fullName,
-          hostPhone: senderPhone,
-          guestPhone: activeResSession.guestPhone || null,
-          details: rawText,
-          taskType: activeResSession.taskType || 'RUNNER_SERVICE',
-          payout: 'R25.00',
-          feePaid: 'R35.00'
-        };
-
-        await persistJob(jobRecord);
-        residentSessions.delete(senderPhone);
-
-        const checkoutUrl = await generatePaystackCheckout(senderPhone, hostProfile.unit, jobId);
-
-        await sendWhatsAppMessage(
+        await createAndPromptRunnerBooking(
           senderPhone,
-          `💳 *Confirm Ponte Runner Booking [#${jobId}]*\n\n` +
-            `• *Service:* ${jobRecord.taskType === 'PARCEL_COLLECTION' ? 'Parcel Collection' : 'Visitor Escort'}\n` +
-            `• *Pickup Note:* _"${rawText}"_\n` +
-            `• *Amount Due:* *R35.00* (Launch Promo)\n\n` +
-            `👉 *Tap Link to Complete Payment:*\n${checkoutUrl}\n\n` +
-            `_Once paid, task broadcasts instantly to active runners._`,
-          PHONE_ID_MAIN
+          activeResSession.taskType || 'PARCEL_COLLECTION',
+          rawText,
+          activeResSession.guestPhone || null,
+          null
         );
         return;
       }
@@ -2176,13 +2346,13 @@ app.post('/webhook', async (req, res) => {
 
         await sendInteractiveButtons(
           senderPhone,
-          'REQUEST A RUNNER',
-          'Select the runner service you require:',
+          'RUNNER & CONCIERGE DISPATCH',
+          'Select the service you need—or drop an order screenshot anytime:',
           [
             { id: 'REQ_RUNNER_PARCEL', title: 'Collect Delivery 🛒' },
             { id: 'REQ_RUNNER_ESCORT', title: 'Escort a Visitor 👥' }
           ],
-          'Promo Rate: R35.00 per service',
+          'Promo Rate: R35.00 · Local Partners (Soon)',
           PHONE_ID_MAIN
         );
         return;
@@ -2214,7 +2384,7 @@ app.post('/webhook', async (req, res) => {
         await sendWhatsAppMessage(
           senderPhone,
           zone === 'RETAIL_PARKING'
-            ? `🅿️ *Retail / Parking Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Lerato Khumalo, 0831112233`
+            ? `🅿️ *Retail / Parking Pre-Clearance (Coming Soon)*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Lerato Khumalo, 0831112233`
             : `👥 *Ponte Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`,
           PHONE_ID_MAIN
         );
@@ -2245,7 +2415,7 @@ app.post('/webhook', async (req, res) => {
             { id: 'ACCESS_TYPE_VEHICLE', title: 'Resident Parking' },
             { id: 'ACCESS_TYPE_EHAILING', title: 'Uber / Bolt' },
           ],
-          '',
+          'Parking & Uber/Bolt passes: Roadmap preview',
           PHONE_ID_MAIN
         );
         return;
