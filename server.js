@@ -260,8 +260,8 @@ const securityAlerts = new Map();
 const customerBacklogQueue = [];
 const systemIncidentLog = [];
 
-// Seed Verified Admin Resident & Active Runners
-userProfiles.set('27715720458', { role: 'RESIDENT', verified: true, registeredAt: new Date().toISOString(), unit: '5102', fullName: 'RC Janse van Rensburg' });
+// Seed Verified Admin Resident (Penthouse 5302) & Active Runners
+userProfiles.set('27715720458', { role: 'RESIDENT', verified: true, registeredAt: new Date().toISOString(), unit: '5302', fullName: 'RC Janse van Rensburg' });
 userProfiles.set('27832778743', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Kaycee' });
 userProfiles.set('27822229285', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Vusi' });
 userProfiles.set('27688814679', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Musa' });
@@ -432,8 +432,23 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     lowerIssue.includes('broadcast') ||
     lowerIssue.includes('roster') ||
     lowerIssue.includes('registered runner') ||
-    (lowerIssue.includes('runner') && (lowerIssue.includes('not getting') || lowerIssue.includes('not receiving') || lowerIssue.includes('list') || lowerIssue.includes('check')))
+    lowerIssue.includes('active runner') ||
+    (lowerIssue.includes('runner') && (lowerIssue.includes('not getting') || lowerIssue.includes('not receiving') || lowerIssue.includes('list') || lowerIssue.includes('check') || lowerIssue.includes('show')))
   ) {
+    const allRunners = Array.from(userProfiles.entries()).filter(([, p]) => p.role === 'RUNNER');
+    const activeRunners = allRunners.filter(([, p]) => p.active !== false);
+
+    // Never auto-enroll ADMIN_REPORT_PHONE as a runner; simply list current roster
+    if (senderPhone === ADMIN_REPORT_PHONE) {
+      const rosterSummary = activeRunners
+        .map(([ph, p], i) => `${i + 1}. ${p.fullName} (${ph})`)
+        .join(', ');
+      return {
+        resolved: true,
+        message: `🏃 *Active Runner Roster (${activeRunners.length}):* ${rosterSummary || 'None registered yet.'}`
+      };
+    }
+
     const existingProfile = userProfiles.get(senderPhone);
     let actionTaken = '';
 
@@ -455,21 +470,21 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
       actionTaken = `Verified ${senderPhone} is active on Runner Roster.`;
     }
 
-    const activeRunners = Array.from(userProfiles.entries()).filter(
+    const updatedActiveRunners = Array.from(userProfiles.entries()).filter(
       ([, p]) => p.role === 'RUNNER' && p.active !== false
     );
     const openJobs = Array.from(runnerJobs.values()).filter((j) => j.status === 'PAID_AWAITING_CLAIM');
 
     for (const job of openJobs) {
-      await broadcastRunnerJob(job);
+      await broadcastRunnerJob(job, senderPhone);
     }
 
     const logEntry = {
       incidentId: `INC-${Date.now().toString().slice(-4)}`,
       timestamp: `${dateSast} ${nowSast}`,
       caller: senderPhone,
-      rootCause: `Runner broadcast check requested (${existingProfile ? 'Registered' : 'Missing from pre-DB roster'}).`,
-      resolution: `${actionTaken} Active Roster: ${activeRunners.length} runners. Re-broadcast ${openJobs.length} open job(s).`,
+      rootCause: `Runner broadcast check requested (${existingProfile ? 'Registered' : 'Missing from roster'}).`,
+      resolution: `${actionTaken} Active Roster: ${updatedActiveRunners.length} runners. Sent ${openJobs.length} open job(s).`,
       status: 'AUTO_RESOLVED'
     };
     await persistIncident(logEntry);
@@ -487,8 +502,8 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
       message:
         `🛠️ *Auto-Fix Executed [${logEntry.incidentId}]:*\n` +
         `• ${actionTaken}\n` +
-        `• *Active Runners on Roster:* ${activeRunners.length}\n` +
-        `• *Open Jobs Re-Broadcast:* ${openJobs.length}\n\n` +
+        `• *Active Runners on Roster:* ${updatedActiveRunners.length}\n` +
+        `• *Open Jobs Sent:* ${openJobs.length}\n\n` +
         `You are confirmed active on the persistent roster and will receive all task dispatches.`
     };
   }
@@ -593,12 +608,12 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     };
   }
 
-  // 5. OPS FAULT: Active Runner Delay / Stalled Errand
+  // 5. OPS FAULT: Active Runner Delay / Stalled Errand (Explicit late/stalled report only)
   const userJobs = Array.from(runnerJobs.values()).filter(
     (j) => j.hostPhone === senderPhone && j.status !== 'COMPLETED_VERIFIED'
   );
 
-  if (userJobs.length > 0) {
+  if (userJobs.length > 0 && (lowerIssue.includes('late') || lowerIssue.includes('stalled') || lowerIssue.includes('stuck') || lowerIssue.includes('delay'))) {
     const latestJob = userJobs[userJobs.length - 1];
     const previousRunner = latestJob.claimedBy;
     const runnerName = previousRunner ? (userProfiles.get(previousRunner)?.fullName || previousRunner) : 'Unassigned';
@@ -651,7 +666,7 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     (a) => (a.hostPhone === senderPhone || a.visitorPhone === senderPhone) && a.status === 'PENDING_MANUAL_REVIEW'
   );
 
-  if (userAlerts.length > 0) {
+  if (userAlerts.length > 0 && (lowerIssue.includes('gate') || lowerIssue.includes('pass') || lowerIssue.includes('turnstile') || lowerIssue.includes('clearance'))) {
     const alert = userAlerts[userAlerts.length - 1];
     alert.status = 'APPROVED';
     await persistAlert(alert);
@@ -703,19 +718,16 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
 
 // ============================================================================
 // DETERMINISTIC + EXPLICIT-MODE SUPPORT, SELF-HEALING & BACKLOG AGENT
-// forcedMode: 'GENERAL' | 'ISSUE' | 'IMPROVE' | null (auto-detect)
 // ============================================================================
 async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromPhoneId = PHONE_ID_MAIN, forcedMode = null) {
   const lowerMsg = userMessage.toLowerCase();
 
-  // EXPLICIT MODE 1: User tapped "Report an Issue"
   if (forcedMode === 'ISSUE') {
     const remediation = await diagnoseAndRemediateOperationalIssue(senderPhone, userMessage);
     await sendWhatsAppMessage(senderPhone, remediation.message, replyFromPhoneId);
     return;
   }
 
-  // AUTO-DETECT FAULTS (when not forced to GENERAL or IMPROVE)
   if (!forcedMode) {
     const faultKeywords = [
       'audit', 'report', '20:00', 'schedule', 'hud', 'backlog', 'status',
@@ -731,7 +743,6 @@ async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromP
     }
   }
 
-  // GEMINI 2.5 FLASH TRIAGE (Handles General Assistance & Suggested Improvements)
   try {
     const modeDirective =
       forcedMode === 'IMPROVE'
@@ -1383,7 +1394,6 @@ app.post('/webhook', async (req, res) => {
 
     if (!message) return;
 
-    // Deduplicate Meta cold-start retries
     if (isDuplicateMessage(message.id)) {
       console.log(`⏭️ [DEDUP] Skipping duplicate webhook message ID: ${message.id}`);
       return;
@@ -1536,14 +1546,30 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // 2. STANDALONE RUNNER ONBOARDING
+      // 2. IMMEDIATE RUNNER ENROLLMENT IN POSTGRESQL + OPTIONAL NAME UPDATE
       if (buttonId === 'ROLE_RUNNER') {
-        residentSessions.set(senderPhone, { step: 'AWAITING_RUNNER_ONBOARDING' });
+        const existingRunner = userProfiles.get(senderPhone);
+        const runnerProfile = {
+          role: 'RUNNER',
+          verified: true,
+          active: true,
+          registeredAt: existingRunner?.registeredAt || new Date().toISOString(),
+          unit: existingRunner?.unit || 'RESIDENT_RUNNER',
+          fullName: existingRunner?.fullName || `Runner (${senderPhone.slice(-4)})`
+        };
+        await persistProfile(senderPhone, runnerProfile);
+        residentSessions.set(senderPhone, { step: 'AWAITING_RUNNER_NAME_UPDATE' });
+
         await sendWhatsAppMessage(
           senderPhone,
-          `🏃 *Ponte Runner Registration*\n\nReply with your *Full Name* (and optional Unit #):\n*Example:* Sipho Ndlovu, Unit 1408`,
+          `🏃 *Runner Roster Activated!*\n\nYou are now saved in PostgreSQL as *${runnerProfile.fullName}* and will receive task broadcasts immediately.\n\nReply with your *Full Name* (and optional Unit #) if you'd like to update your display name:\n*Example:* Sipho Ndlovu, Unit 1408`,
           PHONE_ID_MAIN
         );
+
+        const openJobs = Array.from(runnerJobs.values()).filter((j) => j.status === 'PAID_AWAITING_CLAIM');
+        for (const job of openJobs) {
+          await broadcastRunnerJob(job, senderPhone);
+        }
         return;
       }
 
@@ -1921,6 +1947,59 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      // RUNNER SELF-CHECK & ONBOARDING TRIGGER (Via QR Code or "runner status")
+      if (cleanText === 'runner status' || cleanText === 'check runner' || cleanText === 'active runners') {
+        const allRunners = Array.from(userProfiles.entries()).filter(([, p]) => p.role === 'RUNNER');
+        const activeRunners = allRunners.filter(([, p]) => p.active !== false);
+
+        if (senderPhone === ADMIN_REPORT_PHONE) {
+          const rosterLines = activeRunners
+            .map(([ph, p], idx) => `${idx + 1}. *${p.fullName}* (${ph}) — 🟢 Active`)
+            .join('\n');
+          await sendWhatsAppMessage(
+            senderPhone,
+            `🏃 *REGISTERED RUNNER ROSTER (${activeRunners.length})*\n\n${rosterLines || '_No runners registered yet._'}`,
+            PHONE_ID_MAIN
+          );
+          return;
+        }
+
+        const existing = userProfiles.get(senderPhone);
+        if (existing && existing.role === 'RUNNER') {
+          existing.active = true;
+          await persistProfile(senderPhone, existing);
+          const openJobs = Array.from(runnerJobs.values()).filter((j) => j.status === 'PAID_AWAITING_CLAIM');
+          await sendWhatsAppMessage(
+            senderPhone,
+            `✅ *Runner Status: ACTIVE*\n\n• *Name:* ${existing.fullName}\n• *Roster:* Verified in PostgreSQL\n• *Open Jobs Waiting:* ${openJobs.length}`,
+            PHONE_ID_MAIN
+          );
+          for (const job of openJobs) {
+            await broadcastRunnerJob(job, senderPhone);
+          }
+          return;
+        }
+
+        // Auto-enroll immediately in PostgreSQL on QR/status check + prompt for full name
+        const newRunner = {
+          role: 'RUNNER',
+          verified: true,
+          active: true,
+          registeredAt: new Date().toISOString(),
+          unit: 'RESIDENT_RUNNER',
+          fullName: `Runner (${senderPhone.slice(-4)})`
+        };
+        await persistProfile(senderPhone, newRunner);
+        residentSessions.set(senderPhone, { step: 'AWAITING_RUNNER_NAME_UPDATE' });
+
+        await sendWhatsAppMessage(
+          senderPhone,
+          `✅ *Runner Status Activated!* You are saved in PostgreSQL and will receive task broadcasts immediately.\n\nReply with your *Full Name* (and optional Unit #) to update your profile name:\n*Example:* Sipho Ndlovu, Unit 1408`,
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
       // Admin shortcut: "approve resident 0821234567"
       if (senderPhone === ADMIN_REPORT_PHONE && lowerText.startsWith('approve resident ')) {
         let target = lowerText.replace('approve resident ', '').replace(/\D/g, '');
@@ -1993,26 +2072,26 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // COMPLETE RUNNER SELF-REGISTRATION
-      if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_ONBOARDING') {
+      // UPDATE RUNNER DISPLAY NAME AFTER INSTANT ROSTER ACTIVATION
+      if (activeResSession && (activeResSession.step === 'AWAITING_RUNNER_ONBOARDING' || activeResSession.step === 'AWAITING_RUNNER_NAME_UPDATE')) {
         const parts = rawText.split(',');
         const fullName = parts[0].trim();
         const unit = parts[1] ? parts[1].trim().toUpperCase() : 'RESIDENT_RUNNER';
 
-        const newRunner = {
+        const updatedRunner = {
           role: 'RUNNER',
           verified: true,
           active: true,
-          registeredAt: new Date().toISOString(),
+          registeredAt: userProfiles.get(senderPhone)?.registeredAt || new Date().toISOString(),
           unit,
           fullName
         };
-        await persistProfile(senderPhone, newRunner);
+        await persistProfile(senderPhone, updatedRunner);
         residentSessions.delete(senderPhone);
 
         await sendWhatsAppMessage(
           senderPhone,
-          `🏃 *Runner Roster Activated — Welcome ${fullName}!*\n\nYour profile is saved permanently in PostgreSQL. You will receive interactive job cards whenever residents book deliveries or escorts.`,
+          `🏃 *Runner Profile Updated — ${fullName}!*\n\nYour profile is saved permanently in PostgreSQL. You will receive interactive job cards whenever residents book deliveries or escorts.`,
           PHONE_ID_MAIN
         );
 
@@ -2194,7 +2273,6 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      // SMART FALLBACK: Route 3+ word sentences to AI Support; show 3-button menu for anything shorter
       if (rawText.split(/\s+/).length >= 3) {
         await handleSupportAndBacklogAgent(senderPhone, rawText, PHONE_ID_MAIN, null);
       } else {
