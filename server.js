@@ -38,6 +38,21 @@ const FALLBACK_PAYMENT_PAGE = 'https://paystack.shop/pay/lv9owmpxuo';
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // ============================================================================
+// WEBHOOK MESSAGE DEDUPLICATION CACHE (PREVENTS META COLD-START DOUBLE REPLIES)
+// ============================================================================
+const processedMessageIds = new Set();
+function isDuplicateMessage(msgId) {
+  if (!msgId) return false;
+  if (processedMessageIds.has(msgId)) return true;
+  processedMessageIds.add(msgId);
+  if (processedMessageIds.size > 1000) {
+    const first = processedMessageIds.values().next().value;
+    processedMessageIds.delete(first);
+  }
+  return false;
+}
+
+// ============================================================================
 // POSTGRESQL PERSISTENCE ENGINE (WRITE-THROUGH + STARTUP REHYDRATION)
 // ============================================================================
 const pool = process.env.DATABASE_URL
@@ -55,6 +70,11 @@ async function initDatabase() {
 
   try {
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS ponte_user_profiles (
+        phone TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS ponte_runner_jobs (
         job_id TEXT PRIMARY KEY,
         payload JSONB NOT NULL,
@@ -82,7 +102,15 @@ async function initDatabase() {
       );
     `);
 
-    // Rehydrate in-memory stores from PostgreSQL on startup
+    // Rehydrate user profiles from DB (and persist seed profiles if not yet stored)
+    const profilesRes = await pool.query('SELECT phone, payload FROM ponte_user_profiles');
+    for (const row of profilesRes.rows) {
+      userProfiles.set(row.phone, row.payload);
+    }
+    for (const [phone, profile] of userProfiles.entries()) {
+      await persistProfile(phone, profile);
+    }
+
     const jobsRes = await pool.query('SELECT job_id, payload FROM ponte_runner_jobs');
     for (const row of jobsRes.rows) runnerJobs.set(row.job_id, row.payload);
 
@@ -101,10 +129,25 @@ async function initDatabase() {
     for (const row of incidentsRes.rows) systemIncidentLog.push(row.payload);
 
     console.log(
-      `✅ [DB HYDRATED] Jobs: ${runnerJobs.size} | Passes: ${issuedPasses.size} | Alerts: ${securityAlerts.size} | Stories: ${customerBacklogQueue.length} | Incidents: ${systemIncidentLog.length}`
+      `✅ [DB HYDRATED] Profiles: ${userProfiles.size} | Jobs: ${runnerJobs.size} | Passes: ${issuedPasses.size} | Alerts: ${securityAlerts.size} | Stories: ${customerBacklogQueue.length} | Incidents: ${systemIncidentLog.length}`
     );
   } catch (err) {
     console.error('❌ [DB INIT ERROR]:', err.message);
+  }
+}
+
+async function persistProfile(phone, profile) {
+  userProfiles.set(phone, profile);
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO ponte_user_profiles (phone, payload, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (phone) DO UPDATE SET payload = $2::jsonb, updated_at = NOW()`,
+      [phone, JSON.stringify(profile)]
+    );
+  } catch (err) {
+    console.error('❌ [DB] persistProfile error:', err.message);
   }
 }
 
@@ -218,12 +261,12 @@ const securityAlerts = new Map();
 const customerBacklogQueue = [];
 const systemIncidentLog = [];
 
-// Seed Verified Resident & Active Runners
-userProfiles.set('27715720458', { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
-userProfiles.set('27832778743', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Kaycee' });
-userProfiles.set('27822229285', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Vusi' });
-userProfiles.set('27688814679', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Musa' });
-userProfiles.set('27656206712', { role: 'RUNNER', registeredAt: new Date(), fullName: 'Faith' });
+// Seed Verified Admin Resident & Active Runners
+userProfiles.set('27715720458', { role: 'RESIDENT', verified: true, registeredAt: new Date().toISOString(), unit: '5102', fullName: 'RC Janse van Rensburg' });
+userProfiles.set('27832778743', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Kaycee' });
+userProfiles.set('27822229285', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Vusi' });
+userProfiles.set('27688814679', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Musa' });
+userProfiles.set('27656206712', { role: 'RUNNER', verified: true, active: true, registeredAt: new Date().toISOString(), fullName: 'Faith' });
 
 // ============================================================================
 // HUD BASIC AUTH GUARD (PROTECTS /admin/* & /security/*)
@@ -332,7 +375,7 @@ async function sendWhatsAppImage(recipientPhone, imageUrl, caption, senderPhoneI
   }
 }
 
-async function broadcastRunnerJob(job) {
+async function broadcastRunnerJob(job, singleRunnerPhone = null) {
   const runnerAlertText =
     `🏃 *NEW PONTE RUNNER TASK [#${job.jobId}]*\n\n` +
     `• *Type:* ${job.taskType}\n` +
@@ -340,8 +383,24 @@ async function broadcastRunnerJob(job) {
     `📌 *Pickup Instructions:*\n_${job.details}_\n\n` +
     `• *Payout:* ${job.payout}`;
 
+  if (singleRunnerPhone) {
+    await sendInteractiveButtons(
+      singleRunnerPhone,
+      'PONTE TASK DISPATCH',
+      runnerAlertText,
+      [
+        { id: `JOB_ACCEPT_${job.jobId}`, title: 'Accept Task 🚀' },
+        { id: `JOB_DECLINE_${job.jobId}`, title: 'Decline' }
+      ],
+      '',
+      PHONE_ID_MAIN
+    );
+    return 1;
+  }
+
+  let sentCount = 0;
   for (const [phone, profile] of userProfiles.entries()) {
-    if (profile.role === 'RUNNER') {
+    if (profile.role === 'RUNNER' && profile.active !== false) {
       await sendInteractiveButtons(
         phone,
         'PONTE TASK DISPATCH',
@@ -353,12 +412,15 @@ async function broadcastRunnerJob(job) {
         '',
         PHONE_ID_MAIN
       );
+      sentCount++;
     }
   }
+  console.log(`📣 [BROADCAST] Job #${job.jobId} sent to ${sentCount} active runner(s).`);
+  return sentCount;
 }
 
 // ============================================================================
-// AUTONOMOUS DIAGNOSTICS & SELF-HEALING ENGINE (SYSTEM + OPS)
+// AUTONOMOUS DIAGNOSTICS & SELF-HEALING ENGINE (SYSTEM + ROSTER + OPS)
 // ============================================================================
 async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescription) {
   console.log(`🩺 [DIAGNOSTICS] Investigating issue from ${senderPhone}: "${issueDescription}"`);
@@ -366,7 +428,112 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
   const nowSast = new Date().toLocaleTimeString('en-ZA', { timeZone: 'Africa/Johannesburg' });
   const dateSast = new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' });
 
-  // 1. SYSTEM FAULT: Daily Audit Report / Scheduler Missed Tick
+  // 1. RUNNER ROSTER / BROADCAST DIAGNOSTIC & AUTO-ENROLLMENT
+  if (
+    lowerIssue.includes('broadcast') ||
+    lowerIssue.includes('roster') ||
+    lowerIssue.includes('registered runner') ||
+    (lowerIssue.includes('runner') && (lowerIssue.includes('not getting') || lowerIssue.includes('not receiving') || lowerIssue.includes('list') || lowerIssue.includes('check')))
+  ) {
+    const existingProfile = userProfiles.get(senderPhone);
+    let actionTaken = '';
+
+    if (!existingProfile || existingProfile.role !== 'RUNNER') {
+      const newRunner = {
+        role: 'RUNNER',
+        verified: true,
+        active: true,
+        registeredAt: new Date().toISOString(),
+        fullName: existingProfile?.fullName || `Runner (${senderPhone.slice(-4)})`
+      };
+      await persistProfile(senderPhone, newRunner);
+      actionTaken = `Auto-enrolled ${senderPhone} onto PostgreSQL Runner Roster.`;
+    } else if (existingProfile.active === false) {
+      existingProfile.active = true;
+      await persistProfile(senderPhone, existingProfile);
+      actionTaken = `Re-activated standby flag for ${senderPhone}.`;
+    } else {
+      actionTaken = `Verified ${senderPhone} is active on Runner Roster.`;
+    }
+
+    const activeRunners = Array.from(userProfiles.entries()).filter(
+      ([, p]) => p.role === 'RUNNER' && p.active !== false
+    );
+    const openJobs = Array.from(runnerJobs.values()).filter((j) => j.status === 'PAID_AWAITING_CLAIM');
+
+    for (const job of openJobs) {
+      await broadcastRunnerJob(job);
+    }
+
+    const logEntry = {
+      incidentId: `INC-${Date.now().toString().slice(-4)}`,
+      timestamp: `${dateSast} ${nowSast}`,
+      caller: senderPhone,
+      rootCause: `Runner broadcast check requested (${existingProfile ? 'Registered' : 'Missing from pre-DB roster'}).`,
+      resolution: `${actionTaken} Active Roster: ${activeRunners.length} runners. Re-broadcast ${openJobs.length} open job(s).`,
+      status: 'AUTO_RESOLVED'
+    };
+    await persistIncident(logEntry);
+
+    await sendWhatsAppMessage(
+      ADMIN_REPORT_PHONE,
+      `🛠️ *RUNNER ROSTER SELF-HEALED [${logEntry.incidentId}]*\n` +
+      `• *Caller:* ${senderPhone}\n` +
+      `• *Fix:* ${logEntry.resolution}`,
+      PHONE_ID_MAIN
+    );
+
+    return {
+      resolved: true,
+      message:
+        `🛠️ *Auto-Fix Executed [${logEntry.incidentId}]:*\n` +
+        `• ${actionTaken}\n` +
+        `• *Active Runners on Roster:* ${activeRunners.length}\n` +
+        `• *Open Jobs Re-Broadcast:* ${openJobs.length}\n\n` +
+        `You are confirmed active on the persistent roster and will receive all task dispatches.`
+    };
+  }
+
+  // 2. RESIDENT VERIFICATION STATUS CHECK
+  if (lowerIssue.includes('verify') || lowerIssue.includes('resident') || lowerIssue.includes('unit') || lowerIssue.includes('approve')) {
+    const profile = userProfiles.get(senderPhone);
+    if (profile && profile.role === 'RESIDENT') {
+      const logEntry = {
+        incidentId: `INC-${Date.now().toString().slice(-4)}`,
+        timestamp: `${dateSast} ${nowSast}`,
+        caller: senderPhone,
+        rootCause: `Resident verification status check (Unit ${profile.unit}, Verified: ${profile.verified}).`,
+        resolution: profile.verified ? 'Confirmed verified in PostgreSQL.' : 'Re-sent verification approval card to Admin/Reception.',
+        status: 'AUTO_RESOLVED'
+      };
+      await persistIncident(logEntry);
+
+      if (!profile.verified) {
+        await sendInteractiveButtons(
+          ADMIN_REPORT_PHONE,
+          'RESIDENT VERIFICATION',
+          `🏠 *Resident Awaiting Approval*\n• *Name:* ${profile.fullName}\n• *Unit:* ${profile.unit}\n• *Phone:* ${senderPhone}`,
+          [
+            { id: `VERIFY_RES_${senderPhone}`, title: 'Approve Resident ✅' },
+            { id: `REJECT_RES_${senderPhone}`, title: 'Reject ❌' }
+          ],
+          '',
+          PHONE_ID_MAIN
+        );
+        return {
+          resolved: true,
+          message: `⏳ *Profile Found [${logEntry.incidentId}]:* ${profile.fullName} (Unit ${profile.unit}) is pending verification. I have pinged Reception/Admin for 1-tap approval right now.`
+        };
+      }
+
+      return {
+        resolved: true,
+        message: `✅ *Verified Resident [${logEntry.incidentId}]:* ${profile.fullName} (Unit ${profile.unit}) is active and verified in PostgreSQL.`
+      };
+    }
+  }
+
+  // 3. SYSTEM FAULT: Daily Audit Report / Scheduler Missed Tick
   if (
     lowerIssue.includes('audit') ||
     lowerIssue.includes('report') ||
@@ -379,19 +546,19 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
       incidentId: `INC-${Date.now().toString().slice(-4)}`,
       timestamp: `${dateSast} ${nowSast}`,
       caller: senderPhone,
-      rootCause: 'Render idle sleep skipped internal 20:00 SAST timer.',
-      resolution: 'Auto-dispatched Daily Audit Report immediately & verified /api/cron/daily-audit endpoint.',
+      rootCause: 'Daily Executive Audit reconciliation requested / verified.',
+      resolution: 'Dispatched consolidated 4-section Daily Executive Audit Report to Admin WhatsApp.',
       status: 'AUTO_RESOLVED'
     };
     await persistIncident(logEntry);
 
     return {
       resolved: true,
-      message: `🛠️ *Auto-Fix Executed [${logEntry.incidentId}]:* Render's sleep cycle skipped the internal 20:00 timer. I have dispatched today's Daily Audit Report to your admin WhatsApp right now and logged the incident in the HUD.`
+      message: `🛠️ *Auto-Fix Executed [${logEntry.incidentId}]:* I have dispatched the consolidated 4-section Daily Executive Audit Report to your admin WhatsApp and logged the check.`
     };
   }
 
-  // 2. SYSTEM FAULT: HUD / Database / Telemetry Health Check
+  // 4. SYSTEM FAULT: HUD / Database / Telemetry Health Check
   if (
     lowerIssue.includes('hud') ||
     lowerIssue.includes('backlog') ||
@@ -400,13 +567,16 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     lowerIssue.includes('database') ||
     lowerIssue.includes('memory')
   ) {
-    const dbStatus = pool ? 'CONNECTED (PostgreSQL Persistent)' : 'IN-MEMORY ONLY (Set DATABASE_URL)';
+    const dbStatus = pool ? 'CONNECTED (PostgreSQL Persistent)' : 'IN-MEMORY ONLY';
+    const runnerCount = Array.from(userProfiles.values()).filter((p) => p.role === 'RUNNER' && p.active !== false).length;
+    const residentCount = Array.from(userProfiles.values()).filter((p) => p.role === 'RESIDENT').length;
+
     const logEntry = {
       incidentId: `INC-${Date.now().toString().slice(-4)}`,
       timestamp: `${dateSast} ${nowSast}`,
       caller: senderPhone,
       rootCause: 'System health & persistence telemetry check requested.',
-      resolution: `Verified DB: ${dbStatus} | Jobs: ${runnerJobs.size}, Passes: ${issuedPasses.size}, Stories: ${customerBacklogQueue.length}.`,
+      resolution: `DB: ${dbStatus} | Residents: ${residentCount}, Runners: ${runnerCount}, Jobs: ${runnerJobs.size}.`,
       status: 'AUTO_RESOLVED'
     };
     await persistIncident(logEntry);
@@ -416,14 +586,15 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
       message:
         `📊 *Live System Telemetry [${logEntry.incidentId}]:*\n` +
         `• *Persistence:* ${dbStatus}\n` +
-        `• *Active Jobs:* ${runnerJobs.size}\n` +
+        `• *Registered Residents:* ${residentCount}\n` +
+        `• *Active Runners:* ${runnerCount}\n` +
+        `• *Jobs in DB:* ${runnerJobs.size}\n` +
         `• *Active Passes:* ${issuedPasses.size}\n` +
-        `• *Backlog Stories:* ${customerBacklogQueue.length}\n` +
-        `• *Logged Incidents:* ${systemIncidentLog.length}`
+        `• *Backlog Stories:* ${customerBacklogQueue.length}`
     };
   }
 
-  // 3. OPS FAULT: Active Runner Delay / Stalled Errand
+  // 5. OPS FAULT: Active Runner Delay / Stalled Errand
   const userJobs = Array.from(runnerJobs.values()).filter(
     (j) => j.hostPhone === senderPhone && j.status !== 'COMPLETED_VERIFIED'
   );
@@ -465,7 +636,7 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
       `• *Caller:* ${senderPhone}\n` +
       `• *Issue:* "${issueDescription}"\n` +
       `• *Diagnosis:* Job #${latestJob.jobId} stalled with runner ${runnerName}.\n` +
-      `• *Automated Fix:* Released lock, saved to DB, re-broadcast to 4 runners.`,
+      `• *Automated Fix:* Released lock, saved to DB, re-broadcast to active runners.`,
       PHONE_ID_MAIN
     );
 
@@ -476,7 +647,7 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     };
   }
 
-  // 4. OPS FAULT: Pending Gate Clearance Alert
+  // 6. OPS FAULT: Pending Gate Clearance Alert
   const userAlerts = Array.from(securityAlerts.values()).filter(
     (a) => (a.hostPhone === senderPhone || a.visitorPhone === senderPhone) && a.status === 'PENDING_MANUAL_REVIEW'
   );
@@ -502,19 +673,13 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
     };
     await persistIncident(logEntry);
 
-    await sendWhatsAppMessage(
-      ADMIN_REPORT_PHONE,
-      `🛠️ *AUTO-RESOLVED GATE PASS [${alert.alertId}]*\nGuest ${alert.visitorName} fast-tracked for entry upon host report.`,
-      PHONE_ID_MAIN
-    );
-
     return {
       resolved: true,
       message: `I located guest clearance voucher ${alert.alertId}. The system has verified your resident record and fast-tracked turnstile clearance.`
     };
   }
 
-  // 5. Fallback: Log & Escalate Unmatched Technical Issue
+  // 7. Fallback: Log & Escalate Unmatched Technical Issue
   const logEntry = {
     incidentId: `INC-${Date.now().toString().slice(-4)}`,
     timestamp: `${dateSast} ${nowSast}`,
@@ -543,11 +708,12 @@ async function diagnoseAndRemediateOperationalIssue(senderPhone, issueDescriptio
 async function handleSupportAndBacklogAgent(senderPhone, userMessage, replyFromPhoneId = PHONE_ID_SUPPORT) {
   const lowerMsg = userMessage.toLowerCase();
 
-  // 1. DETERMINISTIC FAST-PATH FOR SYSTEM & OPS FAULTS (Zero AI API Dependency)
+  // 1. DETERMINISTIC FAST-PATH FOR SYSTEM & OPS FAULTS
   const faultKeywords = [
     'audit', 'report', '20:00', 'schedule', 'hud', 'backlog', 'status',
-    'db', 'database', 'memory', 'late', 'runner', 'stuck', 'delay',
-    'gate', 'pass', 'broken', 'error', 'not running', 'not working', 'issue'
+    'db', 'database', 'memory', 'late', 'runner', 'broadcast', 'roster',
+    'stuck', 'delay', 'gate', 'pass', 'broken', 'error', 'not running',
+    'not working', 'not getting', 'not receiving', 'issue', 'verify', 'resident'
   ];
 
   if (faultKeywords.some((kw) => lowerMsg.includes(kw))) {
@@ -595,8 +761,6 @@ Instructions:
     });
 
     const parsed = JSON.parse(response.text.trim());
-    console.log(`🤖 [GEMINI PARSED] Category: ${parsed.category} | Input: "${userMessage}"`);
-
     await sendWhatsAppMessage(senderPhone, parsed.replyText, replyFromPhoneId);
 
     if (parsed.category === 'FEATURE_REQUEST' && parsed.userStory) {
@@ -612,7 +776,6 @@ Instructions:
       };
 
       await persistStory(storyItem);
-      console.log(`📋 [PERSISTED BACKLOG] Added ${storyItem.id}: "${storyItem.userStory}"`);
 
       await sendWhatsAppMessage(
         ADMIN_REPORT_PHONE,
@@ -828,7 +991,7 @@ async function generateTurnstilePass(visitorPhone, visitorData) {
   const passToken = `PC-${visitorData.zone === 'RETAIL_PARKING' ? 'RET' : 'RES'}-${Math.floor(100000 + Math.random() * 900000)}`;
 
   const hostProfile = visitorData.hostPhone ? userProfiles.get(visitorData.hostPhone) : null;
-  const hostUnit = hostProfile ? hostProfile.unit : '5102';
+  const hostUnit = hostProfile ? hostProfile.unit : 'Unknown';
 
   const passObj = {
     passToken,
@@ -1016,21 +1179,32 @@ app.get('/api/turnstile/scan', async (req, res) => {
 });
 
 // ============================================================================
-// AUDIT ENGINE + EXTERNAL CRON TRIGGER
+// CONSOLIDATED 4-SECTION DAILY EXECUTIVE AUDIT ENGINE + EXTERNAL CRON TRIGGER
 // ============================================================================
 function generateAuditSummary() {
+  const todayStr = new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' });
   const jobsList = Array.from(runnerJobs.values());
+  const pendingJobs = jobsList.filter(j => j.status === 'PENDING_PAYMENT');
+  const openPaidJobs = jobsList.filter(j => ['PAID_AWAITING_CLAIM', 'CLAIMED_AWAITING_PICKUP', 'IN_TRANSIT', 'AWAITING_RESIDENT_CONFIRMATION'].includes(j.status));
   const completedJobs = jobsList.filter(j => j.status === 'COMPLETED_VERIFIED');
   const paidJobs = jobsList.filter(j => j.paidAt);
 
-  const totalTasks = jobsList.length;
-  const totalPaidCount = paidJobs.length;
-  const totalCompletedCount = completedJobs.length;
+  const grossRevenue = paidJobs.length * 35.00;
+  const totalRunnerPayouts = completedJobs.length * 25.00;
+  const platformMargin = completedJobs.length * 10.00;
+  const communityRebate = completedJobs.length * 0.50;
 
-  const grossRevenue = totalPaidCount * 35.00;
-  const totalRunnerPayouts = totalCompletedCount * 25.00;
-  const platformMargin = totalCompletedCount * 10.00;
-  const communityRebate = totalCompletedCount * 0.50;
+  // Directory & Onboarding Health
+  const profiles = Array.from(userProfiles.values());
+  const activeRunners = profiles.filter(p => p.role === 'RUNNER' && p.active !== false);
+  const verifiedResidents = profiles.filter(p => p.role === 'RESIDENT' && p.verified);
+  const pendingResidents = profiles.filter(p => p.role === 'RESIDENT' && !p.verified);
+
+  // Self-Healing & Backlog Telemetry (Today + Open Queue)
+  const todaysIncidents = systemIncidentLog.filter(i => i.timestamp && i.timestamp.startsWith(todayStr));
+  const autoResolvedToday = todaysIncidents.filter(i => i.status === 'AUTO_RESOLVED');
+  const escalatedToday = todaysIncidents.filter(i => i.status === 'ESCALATED');
+  const pendingStories = customerBacklogQueue.filter(s => s.status === 'PENDING_APPROVAL');
 
   const runnerStats = {};
   for (const job of completedJobs) {
@@ -1045,14 +1219,22 @@ function generateAuditSummary() {
   }
 
   return {
-    date: new Date().toLocaleDateString('en-ZA', { timeZone: 'Africa/Johannesburg' }),
-    totalTasks,
-    totalPaidCount,
-    totalCompletedCount,
+    date: todayStr,
+    totalTasks: jobsList.length,
+    pendingCount: pendingJobs.length,
+    inProgressCount: openPaidJobs.length,
+    totalPaidCount: paidJobs.length,
+    totalCompletedCount: completedJobs.length,
     grossRevenue,
     totalRunnerPayouts,
     platformMargin,
     communityRebate,
+    activeRunnersCount: activeRunners.length,
+    verifiedResidentsCount: verifiedResidents.length,
+    pendingResidents,
+    autoResolvedToday,
+    escalatedToday,
+    pendingStoriesCount: pendingStories.length,
     runnerStats
   };
 }
@@ -1064,26 +1246,38 @@ async function sendDailyAuditReport() {
   for (const [name, stats] of Object.entries(report.runnerStats)) {
     runnerBreakdownText += `  • *${name}:* ${stats.runs} run(s) -> R${stats.earnings.toFixed(2)}\n`;
   }
-  if (!runnerBreakdownText) runnerBreakdownText = `  • _No verified runs completed today._\n`;
+  if (!runnerBreakdownText) runnerBreakdownText = `  • _No verified runs completed yet._\n`;
+
+  const pendingResAlert = report.pendingResidents.length > 0
+    ? `\n  ⚠️ *Action Needed:* ${report.pendingResidents.map(r => `${r.fullName} (Unit ${r.unit})`).join(', ')}`
+    : '';
+
+  const incidentSummary = report.autoResolvedToday.length > 0 || report.escalatedToday.length > 0
+    ? `\n  • Auto-Resolved Today: *${report.autoResolvedToday.length}* | Escalated: *${report.escalatedToday.length}*`
+    : `\n  • _Zero support faults logged today._`;
 
   const message =
-    `📊 *PONTE CONCIERGE DAILY AUDIT REPORT*\n` +
+    `📊 *PONTE CONCIERGE DAILY EXECUTIVE AUDIT*\n` +
     `📅 *Date:* ${report.date}\n\n` +
-    `• *Total Tasks Created:* ${report.totalTasks}\n` +
-    `• *Tasks Paid (Paystack):* ${report.totalPaidCount}\n` +
-    `• *Tasks Verified Completed:* ${report.totalCompletedCount}\n\n` +
-    `💰 *Financial Reconciliations:*\n` +
-    `• *Gross Revenue (R35/task):* R${report.grossRevenue.toFixed(2)}\n` +
-    `• *Runner Payouts Owed (R25/task):* R${report.totalRunnerPayouts.toFixed(2)}\n` +
-    `• *Platform Margin (R10/task):* R${report.platformMargin.toFixed(2)}\n` +
-    `• *Dlala Nje Community Fund (5%):* R${report.communityRebate.toFixed(2)}\n\n` +
+    `📋 *1. Task Pipeline:*\n` +
+    `• Total: ${report.totalTasks} | Awaiting Pay: ${report.pendingCount} | Active: ${report.inProgressCount} | Done: ${report.totalCompletedCount}\n\n` +
+    `💰 *2. Financial Reconciliations:*\n` +
+    `• *Gross Collected (R35/paid):* R${report.grossRevenue.toFixed(2)}\n` +
+    `• *Runner Payouts Owed (R25/done):* R${report.totalRunnerPayouts.toFixed(2)}\n` +
+    `• *Platform Margin (R10/done):* R${report.platformMargin.toFixed(2)}\n` +
+    `• *Dlala Nje Fund (5%):* R${report.communityRebate.toFixed(2)}\n\n` +
+    `👥 *3. Standalone Directory:*\n` +
+    `• *Residents:* ${report.verifiedResidentsCount} Verified, ${report.pendingResidents.length} Pending${pendingResAlert}\n` +
+    `• *Runners:* ${report.activeRunnersCount} Active on Roster\n\n` +
+    `🩺 *4. Self-Healing & Backlog Pulse:*${incidentSummary}\n` +
+    `  • Staged Feature Stories: *${report.pendingStoriesCount}* awaiting refinement\n\n` +
     `🏃 *Runner Shift Earnings:*\n${runnerBreakdownText}\n` +
-    `_Generated by Ponte Concierge Audit Engine._`;
+    `_Generated automatically by Ponte Concierge Ops Engine._`;
 
   await sendWhatsAppMessage(ADMIN_REPORT_PHONE, message, PHONE_ID_MAIN);
 }
 
-// External Cron Endpoint (Wakes Render reliably at 20:00 SAST / 18:00 UTC)
+// External Cron Endpoint (Wakes Render reliably at 20:00 SAST)
 let lastReportDate = '';
 app.get('/api/cron/daily-audit', async (req, res) => {
   const { token } = req.query;
@@ -1098,7 +1292,7 @@ app.get('/api/cron/daily-audit', async (req, res) => {
   res.json({ status: 'SUCCESS', message: `Daily audit report dispatched for ${todayStr}` });
 });
 
-// Background 15-min interval (runs while awake) + POPIA purge
+// Background 15-min interval + POPIA purge
 setInterval(async () => {
   const now = new Date();
   const utcHours = now.getUTCHours();
@@ -1154,6 +1348,12 @@ app.post('/webhook', async (req, res) => {
 
     if (!message) return;
 
+    // Deduplicate Meta cold-start retries
+    if (isDuplicateMessage(message.id)) {
+      console.log(`⏭️ [DEDUP] Skipping duplicate webhook message ID: ${message.id}`);
+      return;
+    }
+
     const senderPhone = message.from;
     const messageType = message.type;
 
@@ -1180,27 +1380,63 @@ app.post('/webhook', async (req, res) => {
     }
 
     // =========================================================================
-    // CHANNEL B: 081 MAIN ENGINE -> INTERACTIVE BUTTONS, OCR, DISPATCH
+    // CHANNEL B: 081 MAIN ENGINE -> SELF-REGISTRATION, OCR, DISPATCH
     // =========================================================================
     console.log(`🏢 [ROUTING] Handing off message to Ponte Concierge Main Engine for ${senderPhone}...`);
 
     if (messageType === 'interactive' && message.interactive.type === 'button_reply') {
       const buttonId = message.interactive.button_reply.id;
 
+      // 1. STANDALONE RESIDENT ONBOARDING (Captures real Name + Unit #)
       if (buttonId === 'ROLE_RESIDENT') {
-        userProfiles.set(senderPhone, { role: 'RESIDENT', registeredAt: new Date(), unit: '5102', fullName: 'RC Janse van Rensburg' });
-        residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
+        residentSessions.set(senderPhone, { step: 'AWAITING_RESIDENT_ONBOARDING' });
         await sendWhatsAppMessage(
           senderPhone,
-          `🏠 *Ponte Resident Profile Registered*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Sipho Dlamini, 0821234567`,
+          `🏠 *Ponte Resident Registration*\n\nPlease reply with your *Full Name* and *Unit Number* separated by a comma:\n*Example:* Thabo Mokoena, 3204`,
           PHONE_ID_MAIN
         );
         return;
       }
 
+      // 2. STANDALONE RUNNER ONBOARDING (Captures real Name & persists to PostgreSQL)
       if (buttonId === 'ROLE_RUNNER') {
-        userProfiles.set(senderPhone, { role: 'RUNNER', registeredAt: new Date(), fullName: 'Ponte Resident Runner' });
-        await sendWhatsAppMessage(senderPhone, `🏃 *Ponte Runner Roster Activated*`, PHONE_ID_MAIN);
+        residentSessions.set(senderPhone, { step: 'AWAITING_RUNNER_ONBOARDING' });
+        await sendWhatsAppMessage(
+          senderPhone,
+          `🏃 *Ponte Runner Registration*\n\nPlease reply with your *Full Name* (and optional Unit #):\n*Example:* Sipho Ndlovu, Unit 1408`,
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      // 3. ADMIN 1-TAP RESIDENT VERIFICATION BUTTONS
+      if (buttonId.startsWith('VERIFY_RES_')) {
+        const targetPhone = buttonId.replace('VERIFY_RES_', '');
+        const profile = userProfiles.get(targetPhone);
+        if (profile) {
+          profile.verified = true;
+          profile.verifiedAt = new Date().toISOString();
+          await persistProfile(targetPhone, profile);
+          await sendWhatsAppMessage(
+            senderPhone,
+            `✅ *Resident Verified:* ${profile.fullName} (Unit ${profile.unit} - ${targetPhone}) can now issue visitor passes.`,
+            PHONE_ID_MAIN
+          );
+          await sendWhatsAppMessage(
+            targetPhone,
+            `🎉 *Resident Profile Verified!*\n\nWelcome ${profile.fullName} (Unit ${profile.unit}). You now have full access to issue 24-hour visitor passes (*visitor*) and book runners (*runner*).`,
+            PHONE_ID_MAIN
+          );
+        }
+        return;
+      }
+
+      if (buttonId.startsWith('REJECT_RES_')) {
+        const targetPhone = buttonId.replace('REJECT_RES_', '');
+        userProfiles.delete(targetPhone);
+        if (pool) await pool.query('DELETE FROM ponte_user_profiles WHERE phone = $1', [targetPhone]);
+        await sendWhatsAppMessage(senderPhone, `🚫 Resident registration for ${targetPhone} rejected & removed.`, PHONE_ID_MAIN);
+        await sendWhatsAppMessage(targetPhone, `⚠️ Your resident registration could not be verified. Please visit Reception with proof of residence.`, PHONE_ID_MAIN);
         return;
       }
 
@@ -1435,7 +1671,7 @@ app.post('/webhook', async (req, res) => {
 
       if (buttonId.startsWith('AUTH_EXIT_')) {
         const guestPhone = buttonId.replace('AUTH_EXIT_', '');
-        const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'Resident' };
+        const hostProfile = userProfiles.get(senderPhone) || { unit: 'Unknown', fullName: 'Resident' };
 
         const exitAlertId = `EXIT-${Math.floor(1000 + Math.random() * 9000)}`;
         const exitAlert = {
@@ -1504,9 +1740,99 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
+      // Admin shortcut: "approve resident 0821234567"
+      if (senderPhone === ADMIN_REPORT_PHONE && lowerText.startsWith('approve resident ')) {
+        let target = lowerText.replace('approve resident ', '').replace(/\D/g, '');
+        if (target.startsWith('0')) target = '27' + target.substring(1);
+        const prof = userProfiles.get(target);
+        if (prof) {
+          prof.verified = true;
+          await persistProfile(target, prof);
+          await sendWhatsAppMessage(senderPhone, `✅ Approved Resident ${prof.fullName} (Unit ${prof.unit} - ${target}).`, PHONE_ID_MAIN);
+          await sendWhatsAppMessage(target, `🎉 *Resident Profile Verified!* You can now issue visitor passes (*visitor*) and book runners (*runner*).`, PHONE_ID_MAIN);
+        } else {
+          await sendWhatsAppMessage(senderPhone, `⚠️ No pending profile found for ${target}.`, PHONE_ID_MAIN);
+        }
+        return;
+      }
+
       const activeResSession = residentSessions.get(senderPhone);
+
+      // COMPLETE RESIDENT SELF-REGISTRATION
+      if (activeResSession && activeResSession.step === 'AWAITING_RESIDENT_ONBOARDING') {
+        const parts = rawText.split(',');
+        if (parts.length < 2) {
+          await sendWhatsAppMessage(senderPhone, '⚠️ Please separate your *Full Name* and *Unit Number* with a comma (e.g., Thabo Mokoena, 3204).', PHONE_ID_MAIN);
+          return;
+        }
+        const fullName = parts[0].trim();
+        const unit = parts[1].trim().toUpperCase();
+
+        const newResident = {
+          role: 'RESIDENT',
+          verified: false, // Pending Reception/Admin 1-tap approval before issuing visitor passes
+          registeredAt: new Date().toISOString(),
+          unit,
+          fullName
+        };
+        await persistProfile(senderPhone, newResident);
+        residentSessions.delete(senderPhone);
+
+        await sendWhatsAppMessage(
+          senderPhone,
+          `✅ *Resident Profile Saved (${fullName} — Unit ${unit})*\n\n` +
+          `• You can book *paid runner errands* (*runner*) immediately.\n` +
+          `• Your *visitor pass* privileges are queued for quick Reception/Admin unit confirmation.`,
+          PHONE_ID_MAIN
+        );
+
+        await sendInteractiveButtons(
+          ADMIN_REPORT_PHONE,
+          'NEW RESIDENT SIGN-UP',
+          `🏠 *Verify Ponte Resident*\n• *Name:* ${fullName}\n• *Unit:* ${unit}\n• *Phone:* ${senderPhone}`,
+          [
+            { id: `VERIFY_RES_${senderPhone}`, title: 'Approve Resident ✅' },
+            { id: `REJECT_RES_${senderPhone}`, title: 'Reject ❌' }
+          ],
+          '',
+          PHONE_ID_MAIN
+        );
+        return;
+      }
+
+      // COMPLETE RUNNER SELF-REGISTRATION
+      if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_ONBOARDING') {
+        const parts = rawText.split(',');
+        const fullName = parts[0].trim();
+        const unit = parts[1] ? parts[1].trim().toUpperCase() : 'RESIDENT_RUNNER';
+
+        const newRunner = {
+          role: 'RUNNER',
+          verified: true,
+          active: true,
+          registeredAt: new Date().toISOString(),
+          unit,
+          fullName
+        };
+        await persistProfile(senderPhone, newRunner);
+        residentSessions.delete(senderPhone);
+
+        await sendWhatsAppMessage(
+          senderPhone,
+          `🏃 *Runner Roster Activated — Welcome ${fullName}!*\n\nYour profile is saved permanently in our database. You will receive interactive job cards whenever residents book deliveries or escorts.`,
+          PHONE_ID_MAIN
+        );
+
+        // Immediately send any open paid jobs to the newly registered runner
+        const openJobs = Array.from(runnerJobs.values()).filter((j) => j.status === 'PAID_AWAITING_CLAIM');
+        for (const job of openJobs) {
+          await broadcastRunnerJob(job, senderPhone);
+        }
+        return;
+      }
+
       if (activeResSession && activeResSession.step === 'AWAITING_RUNNER_NOTE') {
-        const hostProfile = userProfiles.get(senderPhone) || { unit: '5102', fullName: 'RC Janse van Rensburg' };
+        const hostProfile = userProfiles.get(senderPhone) || { unit: 'UNVERIFIED', fullName: 'Resident' };
         const jobId = Math.floor(1000 + Math.random() * 9000).toString();
 
         const jobRecord = {
@@ -1544,9 +1870,10 @@ app.post('/webhook', async (req, res) => {
         const existing = userProfiles.get(senderPhone);
         if (existing) {
           if (existing.role === 'RESIDENT') {
+            const statusBadge = existing.verified ? '✅ Verified' : '⏳ Pending Unit Approval';
             await sendWhatsAppMessage(
               senderPhone,
-              `👋 *Welcome back Ponte Resident!*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass`,
+              `👋 *Welcome back ${existing.fullName} (Unit ${existing.unit})!* [${statusBadge}]\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• Reply *retail* for parking pass`,
               PHONE_ID_MAIN
             );
             return;
@@ -1554,7 +1881,7 @@ app.post('/webhook', async (req, res) => {
           if (existing.role === 'RUNNER') {
             await sendWhatsAppMessage(
               senderPhone,
-              `🏃 *Welcome back ${existing.fullName}!* (Ponte Runner)\nYou are on active standby for dispatches.`,
+              `🏃 *Welcome back ${existing.fullName}!* (Ponte Runner)\nYou are active on the persistent runner roster.`,
               PHONE_ID_MAIN
             );
             return;
@@ -1576,6 +1903,17 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (cleanText === 'runner' || cleanText === 'parcel' || cleanText === 'delivery') {
+        const existing = userProfiles.get(senderPhone);
+        if (!existing) {
+          residentSessions.set(senderPhone, { step: 'AWAITING_RESIDENT_ONBOARDING' });
+          await sendWhatsAppMessage(
+            senderPhone,
+            `🏠 *Quick Setup First:* Reply with your *Full Name* and *Unit Number* separated by a comma (e.g., Thabo Mokoena, 3204) before booking a runner.`,
+            PHONE_ID_MAIN
+          );
+          return;
+        }
+
         await sendInteractiveButtons(
           senderPhone,
           'REQUEST A RUNNER',
@@ -1590,21 +1928,34 @@ app.post('/webhook', async (req, res) => {
         return;
       }
 
-      if (cleanText === 'visitor' || cleanText === 'invite') {
-        residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'FULL_RESIDENTIAL' });
-        await sendWhatsAppMessage(
-          senderPhone,
-          `👥 *Ponte Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`,
-          PHONE_ID_MAIN
-        );
-        return;
-      }
+      if (cleanText === 'visitor' || cleanText === 'invite' || cleanText === 'retail' || cleanText === 'parking') {
+        const existing = userProfiles.get(senderPhone);
+        if (!existing || existing.role !== 'RESIDENT') {
+          residentSessions.set(senderPhone, { step: 'AWAITING_RESIDENT_ONBOARDING' });
+          await sendWhatsAppMessage(
+            senderPhone,
+            `🏠 *Resident Registration Required*\n\nPlease reply with your *Full Name* and *Unit Number* separated by a comma (e.g., Thabo Mokoena, 3204):`,
+            PHONE_ID_MAIN
+          );
+          return;
+        }
 
-      if (cleanText === 'retail' || cleanText === 'parking') {
-        residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone: 'RETAIL_PARKING' });
+        if (!existing.verified) {
+          await sendWhatsAppMessage(
+            senderPhone,
+            `⏳ *Unit Verification Pending*\n\nYour profile (${existing.fullName}, Unit ${existing.unit}) is awaiting quick Reception/Admin confirmation before issuing visitor passes. You can still book runners (*runner*) immediately!`,
+            PHONE_ID_MAIN
+          );
+          return;
+        }
+
+        const zone = (cleanText === 'retail' || cleanText === 'parking') ? 'RETAIL_PARKING' : 'FULL_RESIDENTIAL';
+        residentSessions.set(senderPhone, { step: 'AWAITING_GUEST_DETAILS', zone });
         await sendWhatsAppMessage(
           senderPhone,
-          `🅿️ *Retail / Parking Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Lerato Khumalo, 0831112233`,
+          zone === 'RETAIL_PARKING'
+            ? `🅿️ *Retail / Parking Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Lerato Khumalo, 0831112233`
+            : `👥 *Ponte Visitor Pre-Clearance*\n\nReply with guest's *Full Name* and *Cell Number* separated by a comma:\n*Example:* Thabo Molefe, 0712345678`,
           PHONE_ID_MAIN
         );
         return;
@@ -1689,7 +2040,7 @@ app.post('/webhook', async (req, res) => {
 
       await sendWhatsAppMessage(
         senderPhone,
-        `👋 *Ponte Concierge*\n\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• For support, message +27 72 949 4561`,
+        `👋 *Ponte Concierge*\n\n• Reply *register* to set up your profile\n• Reply *visitor* to invite guest\n• Reply *runner* to book delivery/escort\n• For support, message +27 72 949 4561`,
         PHONE_ID_MAIN
       );
     }
@@ -1730,6 +2081,19 @@ app.get('/security/live', requireHudAuth, (req, res) => {
     </tr>
   `).join('');
 
+  const pendingResidents = Array.from(userProfiles.entries()).filter(([, p]) => p.role === 'RESIDENT' && !p.verified);
+  const resRows = pendingResidents.map(([phone, p]) => `
+    <tr style="border-bottom: 1px solid #334155;">
+      <td style="padding: 10px; font-weight: bold; color: #facc15;">Unit ${p.unit}</td>
+      <td style="padding: 10px;">${p.fullName}</td>
+      <td style="padding: 10px;">${phone}</td>
+      <td style="padding: 10px;">
+        <a href="/security/verify-resident?phone=${phone}&action=APPROVE" style="background: #22c55e; color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold;">Approve Resident ✅</a>
+        <a href="/security/verify-resident?phone=${phone}&action=REJECT" style="background: #ef4444; color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; margin-left: 6px;">Reject</a>
+      </td>
+    </tr>
+  `).join('');
+
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -1739,7 +2103,7 @@ app.get('/security/live', requireHudAuth, (req, res) => {
         <style>
           body { font-family: sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
           .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #1e293b; padding-bottom: 15px; margin-bottom: 20px; }
-          table { width: 100%; border-collapse: collapse; text-align: left; }
+          table { width: 100%; border-collapse: collapse; text-align: left; margin-bottom: 25px; }
           th { background: #1e293b; padding: 12px; color: #94a3b8; }
           input, select { padding: 10px; border-radius: 4px; border: 1px solid #475569; background: #0f172a; color: white; }
           button { background: #0284c7; color: white; border: none; padding: 10px 20px; border-radius: 4px; font-weight: bold; cursor: pointer; }
@@ -1755,7 +2119,14 @@ app.get('/security/live', requireHudAuth, (req, res) => {
           <thead><tr><th>Alert Ref</th><th>Time</th><th>Visitor Details</th><th>Status / Reason</th><th>Zone</th><th>Action</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #64748b;">No active verification alerts.</td></tr>'}</tbody>
         </table>
-        <div style="background: #1e293b; padding: 20px; border-radius: 8px; margin-top: 30px;">
+
+        <h3 style="color: #facc15;">🏠 Pending Resident Unit Approvals</h3>
+        <table>
+          <thead><tr><th>Unit</th><th>Resident Name</th><th>Mobile</th><th>Reception Verification</th></tr></thead>
+          <tbody>${resRows || '<tr><td colspan="4" style="padding: 15px; text-align: center; color: #64748b;">No residents awaiting unit approval.</td></tr>'}</tbody>
+        </table>
+
+        <div style="background: #1e293b; padding: 20px; border-radius: 8px; margin-top: 20px;">
           <h3 style="margin-top: 0; color: #38bdf8;">🛠️ Guard Assisted Check-In</h3>
           <form action="/security/assisted-clear" method="POST" style="display: flex; gap: 10px; flex-wrap: wrap;">
             <input type="text" name="visitorName" placeholder="Guest Full Name" required>
@@ -1771,6 +2142,24 @@ app.get('/security/live', requireHudAuth, (req, res) => {
       </body>
     </html>
   `);
+});
+
+app.get('/security/verify-resident', requireHudAuth, async (req, res) => {
+  const { phone, action } = req.query;
+  const profile = userProfiles.get(phone);
+  if (profile) {
+    if (action === 'APPROVE') {
+      profile.verified = true;
+      profile.verifiedAt = new Date().toISOString();
+      await persistProfile(phone, profile);
+      await sendWhatsAppMessage(phone, `🎉 *Resident Profile Verified!* Welcome ${profile.fullName} (Unit ${profile.unit}). You can now issue visitor passes (*visitor*) and book runners (*runner*).`, PHONE_ID_MAIN);
+    } else {
+      userProfiles.delete(phone);
+      if (pool) await pool.query('DELETE FROM ponte_user_profiles WHERE phone = $1', [phone]);
+      await sendWhatsAppMessage(phone, `⚠️ Your resident unit registration could not be verified. Please visit Reception.`, PHONE_ID_MAIN);
+    }
+  }
+  res.redirect('/security/live');
 });
 
 app.get('/security/override', requireHudAuth, async (req, res) => {
@@ -1817,7 +2206,7 @@ app.post('/security/assisted-clear', requireHudAuth, async (req, res) => {
 });
 
 // ============================================================================
-// PRODUCT BACKLOG & SELF-HEALING INCIDENT HUD (PROTECTED BY BASIC AUTH)
+// PRODUCT BACKLOG, DIRECTORY & SELF-HEALING INCIDENT HUD
 // ============================================================================
 app.get('/admin/backlog', requireHudAuth, async (req, res) => {
   const { action, id } = req.query;
@@ -1867,6 +2256,18 @@ app.get('/admin/backlog', requireHudAuth, async (req, res) => {
     </tr>
   `).join('');
 
+  const directoryRows = Array.from(userProfiles.entries()).map(([phone, p]) => `
+    <tr style="border-bottom: 1px solid #334155;">
+      <td style="padding: 10px; font-weight: bold; color: ${p.role === 'RUNNER' ? '#38bdf8' : '#a855f7'};">${p.role}</td>
+      <td style="padding: 10px; font-size: 12px;">${p.fullName}</td>
+      <td style="padding: 10px; font-size: 12px;">${p.unit || '—'}</td>
+      <td style="padding: 10px; font-size: 12px;">${phone}</td>
+      <td style="padding: 10px; font-size: 11px; font-weight: bold; color: ${p.verified !== false ? '#4ade80' : '#facc15'};">
+        ${p.role === 'RUNNER' ? (p.active !== false ? 'ACTIVE ON ROSTER' : 'INACTIVE') : (p.verified ? 'VERIFIED' : 'PENDING APPROVAL')}
+      </td>
+    </tr>
+  `).join('');
+
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -1898,6 +2299,15 @@ app.get('/admin/backlog', requireHudAuth, async (req, res) => {
           <thead><tr><th>Incident Ref</th><th>Time</th><th>Reported Fault / Cause</th><th>Auto-Remediation Applied</th><th>Status</th></tr></thead>
           <tbody>${incidentRows || '<tr><td colspan="5" style="padding: 15px; text-align: center; color: #64748b;">No system incidents logged. Systems healthy.</td></tr>'}</tbody>
         </table>
+
+        <div class="header">
+          <h3 style="margin: 0; color: #a855f7;">👥 Standalone Resident & Runner Directory (PostgreSQL)</h3>
+          <div style="font-size: 12px; color: #94a3b8;">Decoupled from HikCentral</div>
+        </div>
+        <table>
+          <thead><tr><th>Role</th><th>Full Name</th><th>Unit</th><th>WhatsApp Number</th><th>Status</th></tr></thead>
+          <tbody>${directoryRows}</tbody>
+        </table>
       </body>
     </html>
   `);
@@ -1913,6 +2323,7 @@ app.get('/', (req, res) => {
     service: 'Ponte Concierge Multi-Channel Pilot Engine',
     status: 'ONLINE',
     persistence: pool ? 'POSTGRESQL' : 'IN_MEMORY',
+    profiles: userProfiles.size,
     time: new Date().toISOString()
   });
 });
